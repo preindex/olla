@@ -42,6 +42,7 @@ var DefaultLocalNetworkTrustedCIDRs = []string{
 
 func DefaultConfig() *Config {
 	return &Config{
+		InferenceHealth: DefaultInferenceHealthConfig(),
 		Server: ServerConfig{
 			Host:            DefaultHost,
 			Port:            DefaultPort,
@@ -97,6 +98,7 @@ func DefaultConfig() *Config {
 			},
 		},
 		Discovery: DiscoveryConfig{
+			Swarm:           DefaultSwarmDiscoveryConfig(),
 			Type:            DefaultDiscoveryType,
 			RefreshInterval: 30 * time.Second,
 			Static: StaticDiscoveryConfig{
@@ -182,6 +184,27 @@ func DefaultConfig() *Config {
 // silent failures at runtime. It is called after all config sources (file, env
 // overrides) have been applied, so the final merged state is what's checked.
 func (c *Config) Validate() error {
+	if err := c.Discovery.Swarm.Validate(); err != nil {
+		return err
+	}
+	if err := c.InferenceHealth.Validate(); err != nil {
+		return err
+	}
+	for _, endpoint := range c.Discovery.Static.Endpoints {
+		if endpoint.ModelFilter != nil {
+			if err := endpoint.ModelFilter.Validate(); err != nil {
+				return fmt.Errorf("endpoint %q model_filter: %w", endpoint.Name, err)
+			}
+		}
+	}
+	if c.Proxy.ProfileFilter != nil {
+		if err := c.Proxy.ProfileFilter.Validate(); err != nil {
+			return fmt.Errorf("proxy.profile_filter: %w", err)
+		}
+		if c.Proxy.ProfileFilter.ParameterRange != nil {
+			return errors.New("proxy.profile_filter.parameter_range is only supported by endpoint model_filter")
+		}
+	}
 	if c.Discovery.Type == "" {
 		return errors.New("discovery.type must not be empty (e.g. \"static\")")
 	}

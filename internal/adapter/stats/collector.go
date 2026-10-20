@@ -29,6 +29,7 @@ import (
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/thushan/olla/internal/core/domain"
 
+	"github.com/thushan/olla/internal/config"
 	"github.com/thushan/olla/internal/core/constants"
 	"github.com/thushan/olla/internal/core/ports"
 	"github.com/thushan/olla/internal/logger"
@@ -66,6 +67,7 @@ type Collector struct {
 
 	// Translator statistics tracking
 	translatorCollector *TranslatorCollector
+	inferenceHealth     *inferenceHealthCollector
 
 	// Using xsync.Counter for better performance under high contention
 	totalRequests      *xsync.Counter
@@ -75,6 +77,8 @@ type Collector struct {
 
 	rateLimitViolations *xsync.Counter
 	sizeLimitViolations *xsync.Counter
+
+	taskConnections map[string]int64
 
 	// Global latency bounds across all endpoints, CAS-updated the same way as
 	// endpointData's per-endpoint bounds (see updateLatencyBounds). minLatency
@@ -87,6 +91,9 @@ type Collector struct {
 	securityMu    sync.RWMutex
 
 	cleanupMu sync.Mutex
+	// Active task counters are separate from URL totals because an old request
+	// can finish after Swarm has assigned its address to a replacement task.
+	taskConnectionsMu sync.Mutex
 }
 
 type endpointData struct {
@@ -109,6 +116,12 @@ func NewCollector(logger logger.StyledLogger) *Collector {
 
 // NewCollectorWithConfig creates a new Collector with custom ModelCollector configuration
 func NewCollectorWithConfig(logger logger.StyledLogger, modelConfig *ModelCollectorConfig) *Collector {
+	return NewCollectorWithConfigs(logger, modelConfig, config.DefaultInferenceHealthConfig())
+}
+
+// NewCollectorWithConfigs creates a collector with custom model and inference
+// health settings.
+func NewCollectorWithConfigs(logger logger.StyledLogger, modelConfig *ModelCollectorConfig, inferenceConfig config.InferenceHealthConfig) *Collector {
 	if modelConfig == nil {
 		modelConfig = DefaultModelCollectorConfig()
 	}
@@ -121,6 +134,7 @@ func NewCollectorWithConfig(logger logger.StyledLogger, modelConfig *ModelCollec
 		minLatency:           -1,
 		modelCollector:       NewModelCollectorWithConfig(modelConfig),
 		translatorCollector:  NewTranslatorCollector(),
+		inferenceHealth:      newInferenceHealthCollector(inferenceConfig),
 		totalRequests:        xsync.NewCounter(),
 		successfulRequests:   xsync.NewCounter(),
 		failedRequests:       xsync.NewCounter(),
@@ -128,6 +142,19 @@ func NewCollectorWithConfig(logger logger.StyledLogger, modelConfig *ModelCollec
 		rateLimitViolations:  xsync.NewCounter(),
 		sizeLimitViolations:  xsync.NewCounter(),
 	}
+}
+
+func (c *Collector) RecordInferenceRequest(outcome ports.InferenceRequestOutcome) {
+	if c.inferenceHealth != nil {
+		c.inferenceHealth.record(outcome)
+	}
+}
+
+func (c *Collector) GetInferenceHealth(knownModels map[string]bool, now time.Time) ports.InferenceHealth {
+	if c.inferenceHealth == nil {
+		return ports.InferenceHealth{Status: "insufficient_data", State: "insufficient_data", Models: map[string]ports.InferenceModelHealth{}}
+	}
+	return c.inferenceHealth.snapshot(knownModels, now)
 }
 
 func (c *Collector) RecordRequest(endpoint *domain.Endpoint, status string, latency time.Duration, bytes int64) {
@@ -154,6 +181,19 @@ func (c *Collector) RecordRequest(endpoint *domain.Endpoint, status string, late
 }
 
 func (c *Collector) RecordConnection(endpoint *domain.Endpoint, delta int) {
+	if endpoint != nil && endpoint.DiscoveryIdentity != "" {
+		c.taskConnectionsMu.Lock()
+		if c.taskConnections == nil {
+			c.taskConnections = make(map[string]int64)
+		}
+		count := c.taskConnections[endpoint.Key()] + int64(delta)
+		if count > 0 {
+			c.taskConnections[endpoint.Key()] = count
+		} else {
+			delete(c.taskConnections, endpoint.Key())
+		}
+		c.taskConnectionsMu.Unlock()
+	}
 	now := time.Now().UnixNano()
 	data := c.getOrInitEndpoint(endpoint, now)
 
@@ -307,6 +347,12 @@ func (c *Collector) GetConnectionStats() map[string]int64 {
 // an endpoint that has never recorded a connection, matching GetConnectionStats'
 // implicit-zero behaviour for missing keys.
 func (c *Collector) GetConnectionCount(endpoint string) int64 {
+	c.taskConnectionsMu.Lock()
+	count, task := c.taskConnections[endpoint]
+	c.taskConnectionsMu.Unlock()
+	if task {
+		return count
+	}
 	data, ok := c.endpoints.Load(endpoint)
 	if !ok {
 		return 0

@@ -876,6 +876,9 @@ func TestTranslationHandler_StreamingPanicRecovery(t *testing.T) {
 			}, nil
 		},
 		transformStreamingFunc: func(ctx context.Context, openaiStream io.Reader, w http.ResponseWriter, original *http.Request) error {
+			if _, err := w.Write([]byte("data: partial\n\n")); err != nil {
+				return err
+			}
 			panic("simulated panic during stream transformation")
 		},
 	}
@@ -896,10 +899,11 @@ func TestTranslationHandler_StreamingPanicRecovery(t *testing.T) {
 		},
 	}
 
+	stats := &inferenceCaptureStats{mockStatsCollector: &mockStatsCollector{}}
 	app := &Application{
 		logger:           mockLogger,
 		proxyService:     proxyService,
-		statsCollector:   &mockStatsCollector{},
+		statsCollector:   stats,
 		repository:       &mockEndpointRepository{},
 		inspectorChain:   inspector.NewChain(mockLogger),
 		profileFactory:   &mockProfileFactory{},
@@ -927,21 +931,19 @@ func TestTranslationHandler_StreamingPanicRecovery(t *testing.T) {
 	// The handler must NOT re-panic. A re-panic resets the TCP connection,
 	// giving the client no indication of what went wrong.
 	//
-	// The proxy writes one SSE event into the pipe, but the translator panics
-	// immediately without reading from it and writing anything to the real client
-	// ResponseWriter. The committedResponseWriter therefore has committed=false,
-	// and the handler correctly falls back to a plain HTTP 502 rather than an SSE
-	// error event. This is the correct behaviour: no bytes reached the client, so
-	// the response is not committed and a proper error status can be sent.
+	// The translator writes one partial event before panicking, so the response is
+	// committed at 200 and recovery must append a structured SSE error.
 	handler.ServeHTTP(rec, req)
 
-	// The panic must not propagate as a connection reset. Because the translator
-	// panicked before writing to the client, the response is uncommitted and a
-	// 502 with a structured error body is the correct outcome.
-	assert.Equal(t, http.StatusBadGateway, rec.Code,
-		"status must be 502 when panic fires before any bytes reach the client")
-	assert.NotContains(t, rec.Body.String(), "event: error",
-		"no SSE event should appear when the response was not committed")
+	// The panic must not propagate as a connection reset or turn the already
+	// committed success status into an apparent successful stream.
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), "event: error")
+	stats.mu.Lock()
+	require.Len(t, stats.outcomes, 1)
+	assert.Equal(t, http.StatusOK, stats.outcomes[0].StatusCode)
+	assert.True(t, stats.outcomes[0].StreamError)
+	stats.mu.Unlock()
 }
 
 // Verifies that:

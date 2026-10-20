@@ -51,6 +51,8 @@ func (s *Service) ProxyRequestToEndpointsWithRetry(ctx context.Context, w http.R
 
 // proxyToSingleEndpoint handles proxying to a single endpoint with Olla's optimizations
 func (s *Service) proxyToSingleEndpoint(ctx context.Context, w http.ResponseWriter, r *http.Request, endpoint *domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+	stats.InferenceTimedOut = false
+	stats.InferenceStreamError = false
 	stats.EndpointName = endpoint.Name
 
 	// The model actually dispatched to this endpoint, resolved from the alias
@@ -129,6 +131,7 @@ func (s *Service) proxyToSingleEndpoint(ctx context.Context, w http.ResponseWrit
 	stats.BackendResponseMs = time.Since(backendStart).Milliseconds()
 
 	if err != nil {
+		stats.InferenceTimedOut = core.IsTimeoutError(err)
 		if cb != nil {
 			cb.RecordFailure(attempt)
 		}
@@ -183,6 +186,10 @@ func (s *Service) proxyToSingleEndpoint(ctx context.Context, w http.ResponseWrit
 	stats.StreamingMs = time.Since(streamStart).Milliseconds()
 	stats.TotalBytes = bytesWritten
 
+	if streamErr != nil {
+		stats.InferenceTimedOut = core.IsTimeoutError(streamErr)
+		stats.InferenceStreamError = r.Context().Err() == nil
+	}
 	if streamErr != nil && !errors.Is(streamErr, context.Canceled) {
 		rlog.Error("streaming failed", "error", streamErr)
 		s.RecordFailure(ctx, endpoint, resolvedModel, time.Since(stats.StartTime), streamErr)

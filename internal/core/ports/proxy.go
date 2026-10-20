@@ -66,6 +66,9 @@ type RequestStats struct {
 	PathResolutionMs    int64 // Time spent resolving the target path to an endpoint
 	SelectionMs         int64 // Time spent selecting endpoint
 
+	InferenceNoRouting   bool
+	InferenceTimedOut    bool
+	InferenceStreamError bool
 }
 
 // DiscoveryService defines the interface for service discovery

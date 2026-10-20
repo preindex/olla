@@ -9,6 +9,7 @@ import (
 
 	"github.com/thushan/olla/internal/config"
 	"github.com/thushan/olla/internal/core/domain"
+	"github.com/thushan/olla/internal/core/ports"
 )
 
 // Mock endpoint repository for testing
@@ -55,6 +56,138 @@ func (m *mockEndpointRepository) Exists(ctx context.Context, endpointURL *url.UR
 func createTestUnifiedRegistry() *UnifiedMemoryModelRegistry {
 	return NewUnifiedMemoryModelRegistry(createTestLogger(), nil, nil, nil)
 }
+
+func TestRemoveEndpointFencesBlockedAsyncUnification(t *testing.T) {
+	registry := createTestUnifiedRegistry()
+	unifier := &blockingModelUnifier{started: make(chan struct{}), release: make(chan struct{}), cleanup: make(chan struct{}, 1)}
+	registry.unifier = unifier
+	ctx := context.Background()
+	endpoint := &domain.Endpoint{URLString: "http://swarm-task:11434", Name: "swarm-task"}
+	if err := registry.RegisterModelsWithEndpoint(ctx, endpoint, []*domain.ModelInfo{{Name: "old-model"}}); err != nil {
+		t.Fatalf("register models: %v", err)
+	}
+	select {
+	case <-unifier.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("unification did not start")
+	}
+
+	removed := make(chan error, 1)
+	go func() { removed <- registry.RemoveEndpoint(ctx, endpoint.URLString) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		registry.generationMu.Lock()
+		_, stillCurrent := registry.unificationTokens[endpoint.URLString]
+		registry.generationMu.Unlock()
+		if !stillCurrent {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(unifier.release)
+			t.Fatal("removal did not invalidate the pending registration")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(unifier.release)
+	select {
+	case err := <-removed:
+		if err != nil {
+			t.Fatalf("remove endpoint: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("removal did not finish after unification was released")
+	}
+
+	models, err := registry.GetUnifiedModels(ctx)
+	if err != nil {
+		t.Fatalf("get unified models: %v", err)
+	}
+	if len(models) != 0 {
+		t.Fatalf("removed endpoint's async worker restored stale models: %+v", models)
+	}
+	if _, exists := registry.GetEndpointSet("stale-model"); exists {
+		t.Fatal("removed endpoint's async worker restored a stale model endpoint cache")
+	}
+	if _, exists := registry.GetEndpointSet("stale-id"); exists {
+		t.Fatal("removed endpoint's async worker restored a stale unified ID cache")
+	}
+	select {
+	case <-unifier.cleanup:
+	default:
+		t.Fatal("endpoint removal did not clear the unifier's internal model catalog")
+	}
+}
+
+func TestRemoveEndpointClearsDefaultUnifierAliasCatalog(t *testing.T) {
+	registry := createTestUnifiedRegistry()
+	ctx := context.Background()
+	endpoint := &domain.Endpoint{URLString: "http://stale-alias:11434", Name: "stale-alias"}
+	if err := registry.RegisterModelsWithEndpoint(ctx, endpoint, []*domain.ModelInfo{{Name: "stale-alias-model", LastSeen: time.Now()}}); err != nil {
+		t.Fatalf("register models: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := registry.GetUnifiedModel(ctx, "stale-alias-model"); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("unified model did not become visible")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if err := registry.RemoveEndpoint(ctx, endpoint.URLString); err != nil {
+		t.Fatalf("remove endpoint: %v", err)
+	}
+	if _, err := registry.GetUnifiedModel(ctx, "stale-alias-model"); err == nil {
+		t.Fatal("removed model remains discoverable through the unifier alias catalog")
+	}
+}
+
+var _ ports.ModelUnifier = (*blockingModelUnifier)(nil)
+
+type blockingModelUnifier struct {
+	started chan struct{}
+	release chan struct{}
+	cleanup chan struct{}
+}
+
+func (u *blockingModelUnifier) UnifyModel(ctx context.Context, model *domain.ModelInfo, endpoint *domain.Endpoint) (*domain.UnifiedModel, error) {
+	models, err := u.UnifyModels(ctx, []*domain.ModelInfo{model}, endpoint)
+	if err != nil || len(models) == 0 {
+		return nil, err
+	}
+	return models[0], nil
+}
+
+func (u *blockingModelUnifier) UnifyModels(_ context.Context, models []*domain.ModelInfo, endpoint *domain.Endpoint) ([]*domain.UnifiedModel, error) {
+	if len(models) == 0 {
+		u.cleanup <- struct{}{}
+		return nil, nil
+	}
+	close(u.started)
+	<-u.release
+	return []*domain.UnifiedModel{{
+		ID: "stale-id",
+		SourceEndpoints: []domain.SourceEndpoint{{
+			EndpointURL: endpoint.GetURLString(),
+			NativeName:  "stale-model",
+		}},
+	}}, nil
+}
+
+func (u *blockingModelUnifier) ResolveAlias(context.Context, string) (*domain.UnifiedModel, error) {
+	return nil, fmt.Errorf("not found")
+}
+
+func (u *blockingModelUnifier) GetAliases(context.Context, string) ([]string, error) { return nil, nil }
+func (u *blockingModelUnifier) GetStats() domain.UnificationStats                    { return domain.UnificationStats{} }
+func (u *blockingModelUnifier) MergeUnifiedModels(_ context.Context, models []*domain.UnifiedModel) (*domain.UnifiedModel, error) {
+	return models[0], nil
+}
+func (u *blockingModelUnifier) Clear(context.Context) error { return nil }
 
 func TestGetHealthyEndpointsForModel(t *testing.T) {
 	ctx := context.Background()

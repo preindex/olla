@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -24,8 +25,14 @@ type UnifiedMemoryModelRegistry struct {
 	globalUnified     *xsync.Map[string, *domain.UnifiedModel]         // UnifiedID -> UnifiedModel (merged across endpoints)
 	endpoints         *xsync.Map[string, *domain.Endpoint]             // URL -> Endpoint mapping
 	modelEndpointSets *xsync.Map[string, *xsync.Map[string, struct{}]] // ModelID -> Set of endpoint URLs (cached for fast lookup)
+	unificationTokens map[string]*unificationToken
 	unificationMutex  sync.Mutex
+	generationMu      sync.Mutex
 }
+
+// A non-zero-sized pointer token uniquely identifies one registration without
+// retaining a counter entry after an endpoint is removed.
+type unificationToken struct{ marker byte }
 
 // NewUnifiedMemoryModelRegistry creates a new registry with unification support
 func NewUnifiedMemoryModelRegistry(logger logger.StyledLogger, unificationConfig *config.UnificationConfig,
@@ -91,6 +98,7 @@ func NewUnifiedMemoryModelRegistry(logger logger.StyledLogger, unificationConfig
 		globalUnified:       xsync.NewMap[string, *domain.UnifiedModel](),
 		endpoints:           xsync.NewMap[string, *domain.Endpoint](),
 		modelEndpointSets:   xsync.NewMap[string, *xsync.Map[string, struct{}]](),
+		unificationTokens:   make(map[string]*unificationToken),
 	}
 }
 
@@ -103,19 +111,29 @@ func (r *UnifiedMemoryModelRegistry) RegisterEndpoint(endpoint *domain.Endpoint)
 
 // RegisterModelsWithEndpoint registers models with full endpoint information
 func (r *UnifiedMemoryModelRegistry) RegisterModelsWithEndpoint(ctx context.Context, endpoint *domain.Endpoint, models []*domain.ModelInfo) error {
-	// Store endpoint
-	r.RegisterEndpoint(endpoint)
-
-	// Register models normally
-	return r.RegisterModels(ctx, endpoint.GetURLString(), models)
+	if endpoint == nil {
+		return errors.New("endpoint is required")
+	}
+	return r.registerModels(ctx, endpoint.GetURLString(), endpoint, models)
 }
 
 // RegisterModels overrides the base method to add unification
 func (r *UnifiedMemoryModelRegistry) RegisterModels(ctx context.Context, endpointURL string, models []*domain.ModelInfo) error {
+	return r.registerModels(ctx, endpointURL, nil, models)
+}
+
+func (r *UnifiedMemoryModelRegistry) registerModels(ctx context.Context, endpointURL string, endpoint *domain.Endpoint, models []*domain.ModelInfo) error {
+	r.generationMu.Lock()
+	if endpoint != nil && endpointURL != "" {
+		r.endpoints.Store(endpointURL, endpoint)
+	}
 	// First, register models normally
 	if err := r.MemoryModelRegistry.RegisterModels(ctx, endpointURL, models); err != nil {
+		r.generationMu.Unlock()
 		return err
 	}
+	token := r.replaceUnificationTokenLocked(endpointURL)
+	r.generationMu.Unlock()
 
 	// Invalidate any cached endpoint sets for these models since they're being updated
 	for _, model := range models {
@@ -125,13 +143,22 @@ func (r *UnifiedMemoryModelRegistry) RegisterModels(ctx context.Context, endpoin
 	}
 
 	// Then unify them
-	go r.unifyModelsAsync(ctx, endpointURL, models)
+	go r.unifyModelsAsync(ctx, endpointURL, models, token)
 
 	return nil
 }
 
+func (r *UnifiedMemoryModelRegistry) replaceUnificationTokenLocked(endpointURL string) *unificationToken {
+	if r.unificationTokens == nil {
+		r.unificationTokens = make(map[string]*unificationToken)
+	}
+	token := &unificationToken{}
+	r.unificationTokens[endpointURL] = token
+	return token
+}
+
 // unifyModelsAsync performs model unification in the background
-func (r *UnifiedMemoryModelRegistry) unifyModelsAsync(ctx context.Context, endpointURL string, models []*domain.ModelInfo) {
+func (r *UnifiedMemoryModelRegistry) unifyModelsAsync(ctx context.Context, endpointURL string, models []*domain.ModelInfo, token *unificationToken) {
 	r.unificationMutex.Lock()
 	defer r.unificationMutex.Unlock()
 
@@ -173,6 +200,11 @@ func (r *UnifiedMemoryModelRegistry) unifyModelsAsync(ctx context.Context, endpo
 			continue
 		}
 
+		r.generationMu.Lock()
+		if r.unificationTokens[endpointURL] != token {
+			r.generationMu.Unlock()
+			return
+		}
 		r.globalUnified.Store(id, merged)
 
 		// update cached endpoint set for this model
@@ -191,6 +223,7 @@ func (r *UnifiedMemoryModelRegistry) unifyModelsAsync(ctx context.Context, endpo
 		for _, alias := range merged.Aliases {
 			r.updateEndpointSet(alias.Name, endpointURLs)
 		}
+		r.generationMu.Unlock()
 	}
 
 	// r.logger.InfoWithEndpoint(" ", endpointUrl, "models", len(unifiedModels))
@@ -310,14 +343,38 @@ func (r *UnifiedMemoryModelRegistry) GetUnifiedStats(ctx context.Context) (Unifi
 
 // RemoveEndpoint overrides to clean up unified models
 func (r *UnifiedMemoryModelRegistry) RemoveEndpoint(ctx context.Context, endpointURL string) error {
+	r.generationMu.Lock()
 	// First remove from base registry
 	if err := r.MemoryModelRegistry.RemoveEndpoint(ctx, endpointURL); err != nil {
+		r.generationMu.Unlock()
 		return err
 	}
+	endpoint, endpointExists := r.endpoints.Load(endpointURL)
+	// Endpoint objects are retained separately for model unification and must
+	// follow the same removal lifecycle as the URL-keyed model records.
+	r.endpoints.Delete(endpointURL)
+	delete(r.unificationTokens, endpointURL)
+	r.generationMu.Unlock()
 
 	// Clean up unified models
 	r.unificationMutex.Lock()
 	defer r.unificationMutex.Unlock()
+	// A newer registration may reuse this URL after the base removal but before
+	// this cleanup acquires the unification lock. Leave its unified state alone.
+	r.generationMu.Lock()
+	newerRegistrationExists := r.unificationTokens[endpointURL] != nil
+	r.generationMu.Unlock()
+	if newerRegistrationExists {
+		return nil
+	}
+
+	// UnifyModels removes the endpoint's previous catalog entries before
+	// publishing the supplied list. Clearing the unifier's own catalog matters
+	// because ResolveAlias falls back to it after globalUnified has been cleaned.
+	if !endpointExists {
+		endpoint = &domain.Endpoint{URLString: endpointURL, Name: endpointURL}
+	}
+	_, unifierErr := r.unifier.UnifyModels(ctx, nil, endpoint)
 
 	// Remove endpoint from all unified models
 	r.globalUnified.Range(func(id string, model *domain.UnifiedModel) bool {
@@ -364,7 +421,7 @@ func (r *UnifiedMemoryModelRegistry) RemoveEndpoint(ctx context.Context, endpoin
 		return true
 	})
 
-	return nil
+	return unifierErr
 }
 
 // GetHealthyEndpointsForModel returns healthy endpoints that have a specific model

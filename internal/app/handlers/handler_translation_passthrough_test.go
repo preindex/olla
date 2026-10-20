@@ -1051,8 +1051,9 @@ func (m *mockDiscoveryServiceWithEndpoints) UpdateEndpointStatus(ctx context.Con
 
 // mockStatsCollectorWithCapture extends mockStatsCollector to capture metrics calls
 type mockStatsCollectorWithCapture struct {
-	recordedEvents []ports.TranslatorRequestEvent
-	mu             sync.Mutex
+	recordedEvents    []ports.TranslatorRequestEvent
+	inferenceOutcomes []ports.InferenceRequestOutcome
+	mu                sync.Mutex
 }
 
 func (m *mockStatsCollectorWithCapture) RecordRequest(endpoint *domain.Endpoint, status string, latency time.Duration, bytes int64) {
@@ -1074,6 +1075,14 @@ func (m *mockStatsCollectorWithCapture) RecordTranslatorRequest(event ports.Tran
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.recordedEvents = append(m.recordedEvents, event)
+}
+func (m *mockStatsCollectorWithCapture) RecordInferenceRequest(outcome ports.InferenceRequestOutcome) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.inferenceOutcomes = append(m.inferenceOutcomes, outcome)
+}
+func (m *mockStatsCollectorWithCapture) GetInferenceHealth(map[string]bool, time.Time) ports.InferenceHealth {
+	return ports.InferenceHealth{}
 }
 func (m *mockStatsCollectorWithCapture) GetTranslatorStats() map[string]ports.TranslatorStats {
 	return nil
@@ -1208,6 +1217,10 @@ func TestTranslationHandler_MetricsRecordedForPassthrough(t *testing.T) {
 	assert.Equal(t, "claude-3-5-sonnet-20241022", event.Model)
 	assert.Equal(t, constants.TranslatorModePassthrough, event.Mode)
 	assert.Equal(t, constants.FallbackReasonNone, event.FallbackReason)
+	statsCollector.mu.Lock()
+	defer statsCollector.mu.Unlock()
+	require.Len(t, statsCollector.inferenceOutcomes, 1, "passthrough request contributes one final inference outcome")
+	assert.Equal(t, http.StatusOK, statsCollector.inferenceOutcomes[0].StatusCode)
 	assert.True(t, event.Success)
 	assert.False(t, event.IsStreaming)
 	assert.Greater(t, event.Latency, time.Duration(0))

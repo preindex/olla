@@ -53,6 +53,8 @@ func (s *Service) ProxyRequestToEndpointsWithRetry(ctx context.Context, w http.R
 // Note: Connection increment/decrement is handled by RetryHandler.executeProxyAttempt
 // to avoid double-counting (see proxy_olla_connection_counting_test.go for context).
 func (s *Service) proxyToSingleEndpoint(ctx context.Context, w http.ResponseWriter, r *http.Request, endpoint *domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+	stats.InferenceTimedOut = false
+	stats.InferenceStreamError = false
 	stats.EndpointName = endpoint.Name
 
 	targetURL := common.BuildTargetURL(r, endpoint, s.configuration.GetProxyPrefix())
@@ -112,6 +114,7 @@ func (s *Service) proxyToSingleEndpoint(ctx context.Context, w http.ResponseWrit
 	stats.BackendResponseMs = time.Since(backendStart).Milliseconds()
 
 	if err != nil {
+		stats.InferenceTimedOut = core.IsTimeoutError(err)
 		// Suppress error logging for connection failures handled by retry logic
 		if core.IsConnectionError(err) {
 			rlog.Debug("round-trip connection failed", "error", err)
@@ -158,6 +161,10 @@ func (s *Service) proxyToSingleEndpoint(ctx context.Context, w http.ResponseWrit
 	stats.StreamingMs = time.Since(streamStart).Milliseconds()
 	stats.TotalBytes = bytesWritten
 
+	if streamErr != nil {
+		stats.InferenceTimedOut = core.IsTimeoutError(streamErr)
+		stats.InferenceStreamError = r.Context().Err() == nil
+	}
 	if streamErr != nil && !errors.Is(streamErr, context.Canceled) {
 		rlog.Error("streaming failed", "error", streamErr)
 		s.RecordFailure(ctx, endpoint, resolvedModel, time.Since(stats.StartTime), streamErr)

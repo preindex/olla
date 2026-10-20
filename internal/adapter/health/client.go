@@ -52,11 +52,12 @@ func (hc *HealthClient) Check(ctx context.Context, endpoint *domain.Endpoint) (r
 	}()
 
 	healthCheckURL := endpoint.GetHealthCheckURLString()
+	breakerKey := healthCircuitKey(endpoint, healthCheckURL)
 
 	// Check circuit breaker first. attempt correlates this specific admitted
 	// probe (half-open case) with the RecordSuccess/RecordFailure call below -
 	// see CircuitBreaker.RecordSuccess for why that matters.
-	circuitOpen, attempt := hc.circuitBreaker.IsOpen(healthCheckURL, endpoint.CheckTimeout)
+	circuitOpen, attempt := hc.circuitBreaker.IsOpen(breakerKey, endpoint.CheckTimeout)
 	if circuitOpen {
 		result = domain.HealthCheckResult{
 			Status:     domain.StatusOffline,
@@ -108,15 +109,15 @@ func (hc *HealthClient) Check(ctx context.Context, endpoint *domain.Endpoint) (r
 	// responding; counting them as failures would trip the CB on misconfigured
 	// credentials or a throttled endpoint, hiding the real cause from the operator.
 	if lastErr != nil {
-		hc.circuitBreaker.RecordFailure(healthCheckURL, attempt)
+		hc.circuitBreaker.RecordFailure(breakerKey, attempt)
 	} else {
 		switch result.Status {
 		case domain.StatusConfigError, domain.StatusRateLimited:
 			// Do not trip the circuit breaker; this is an operator or rate error, not downtime.
 		case domain.StatusHealthy, domain.StatusBusy:
-			hc.circuitBreaker.RecordSuccess(healthCheckURL, attempt)
+			hc.circuitBreaker.RecordSuccess(breakerKey, attempt)
 		default:
-			hc.circuitBreaker.RecordFailure(healthCheckURL, attempt)
+			hc.circuitBreaker.RecordFailure(breakerKey, attempt)
 		}
 	}
 
@@ -125,6 +126,13 @@ func (hc *HealthClient) Check(ctx context.Context, endpoint *domain.Endpoint) (r
 	}
 
 	return result, nil
+}
+
+func healthCircuitKey(endpoint *domain.Endpoint, fallback string) string {
+	if endpoint != nil && endpoint.DiscoveryIdentity != "" {
+		return endpoint.Key()
+	}
+	return fallback
 }
 
 func (hc *HealthClient) performSingleCheck(ctx context.Context, endpoint *domain.Endpoint, healthCheckURL string) (domain.HealthCheckResult, error) {

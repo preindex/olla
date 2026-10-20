@@ -24,6 +24,19 @@ exclude:   # Items matching these patterns are rejected
   - "*debug*"
 ```
 
+Endpoint `model_filter` also accepts optional inclusive parameter-count bounds in billions. These bounds are independent of name patterns and use only structured `details.parameter_size` metadata reported for a discovered model:
+
+```yaml
+model_filter:
+  parameter_range:
+    min_b: 7      # At least 7 billion parameters
+    max_b: 13     # At most 13 billion parameters
+  exclude:
+    - "*embed*"
+```
+
+The two bounds can be used separately or together. Models exactly at a bound pass. Models with missing, malformed, or ambiguous parameter-size metadata are excluded while a bound is active. Olla does not infer parameter counts from model names or disk size. Values must be finite, non-negative, no greater than `1000000000`, and `min_b` cannot exceed `max_b`; invalid configuration prevents startup.
+
 ### Pattern Matching
 
 Olla supports glob-style patterns with the `*` wildcard:
@@ -134,6 +147,8 @@ model_filter:
 ```
 
 ### Model Size Restrictions
+
+Use parameter bounds for metadata-backed filtering. Name patterns remain useful when model names carry a desired size suffix, but are not a reliable parameter-count source.
 
 #### Small Models Only (≤13B)
 ```yaml

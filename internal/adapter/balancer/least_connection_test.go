@@ -394,6 +394,30 @@ func TestLeastConnectionsSelector_Select_UnknownEndpointCountsAsZero(t *testing.
 	}
 }
 
+func TestLeastConnectionsSelector_UsesTaskIncarnationConnectionCounts(t *testing.T) {
+	collector := NewTestStatsCollector()
+	selector := NewLeastConnectionsSelector(collector)
+	oldTask := makeEndpoint("old", "http://shared:11434")
+	oldTask.DiscoveryIdentity = "swarm:old"
+	for range 5 {
+		selector.IncrementConnections(oldTask)
+	}
+	replacement := makeEndpoint("replacement", oldTask.URLString)
+	replacement.DiscoveryIdentity = "swarm:new"
+	other := makeEndpoint("other", "http://other:11434")
+	other.DiscoveryIdentity = "swarm:other"
+	selector.IncrementConnections(other)
+	selector.DecrementConnections(oldTask)
+
+	selected, err := selector.Select(context.Background(), []*domain.Endpoint{replacement, other})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.DiscoveryIdentity != replacement.DiscoveryIdentity {
+		t.Fatalf("replacement inherited old task connection count: selected %q", selected.DiscoveryIdentity)
+	}
+}
+
 // TestLeastConnectionsSelector_Select_PicksFewestAmongMany pins the selection
 // contract across more than two candidates with distinct, non-adjacent
 // connection counts to guard against an off-by-one in the min-tracking loop.

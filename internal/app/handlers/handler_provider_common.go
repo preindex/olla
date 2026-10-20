@@ -78,6 +78,9 @@ func (a *Application) providerProxyHandler(w http.ResponseWriter, r *http.Reques
 	}
 
 	pr := a.initializeProxyRequest(r)
+	outcomeWriter := newInferenceOutcomeWriter(w)
+	w = outcomeWriter
+	defer a.recordInferenceOutcome(r.Context(), pr, outcomeWriter)
 
 	// Provider type must flow through the entire request lifecycle to ensure
 	// consistent routing decisions

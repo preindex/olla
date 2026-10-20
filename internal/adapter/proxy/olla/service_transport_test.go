@@ -1,17 +1,72 @@
 package olla
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"runtime"
 	"testing"
 	"time"
 
 	proxyconfig "github.com/thushan/olla/internal/adapter/proxy/config"
+	"github.com/thushan/olla/internal/adapter/proxy/core"
+	"github.com/thushan/olla/internal/core/domain"
+	"github.com/thushan/olla/internal/core/ports"
 )
 
 // funcName extracts the full symbol name of a function value.
 func funcName(f interface{}) string {
 	return runtime.FuncForPC(reflect.ValueOf(f).Pointer()).Name()
+}
+
+func TestInferenceTimeoutSurvivesFriendlyErrorAndSuccessfulAttemptClearsIt(t *testing.T) {
+	cfg := &Configuration{}
+	cfg.StreamBufferSize = 8192
+	cfg.ResponseHeaderTimeout = 100 * time.Millisecond
+	service, err := NewService(nil, nil, cfg, nil, nil, createTestLogger())
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	t.Cleanup(service.Cleanup)
+
+	stalled := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer stalled.Close()
+	stalledURL, _ := url.Parse(stalled.URL)
+	stats := &ports.RequestStats{StartTime: time.Now()}
+	err = service.proxyToSingleEndpoint(context.Background(), httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodGet, "/test", nil),
+		&domain.Endpoint{Name: "stalled", URL: stalledURL, URLString: stalled.URL, Status: domain.StatusHealthy}, stats, createTestLogger())
+	if err == nil {
+		t.Fatal("expected friendly timeout error")
+	}
+	if core.IsTimeoutError(err) {
+		t.Fatalf("friendly error unexpectedly retained timeout type: %T %v", err, err)
+	}
+	if !stats.InferenceTimedOut {
+		t.Fatalf("raw RoundTrip timeout was not retained in request telemetry: %+v", stats)
+	}
+
+	success := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer success.Close()
+	successURL, _ := url.Parse(success.URL)
+	stats.InferenceTimedOut = true
+	stats.InferenceStreamError = true
+	err = service.proxyToSingleEndpoint(context.Background(), httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodGet, "/test", nil),
+		&domain.Endpoint{Name: "healthy", URL: successURL, URLString: success.URL, Status: domain.StatusHealthy}, stats, createTestLogger())
+	if err != nil {
+		t.Fatalf("successful follow-up attempt failed: %v", err)
+	}
+	if stats.InferenceTimedOut || stats.InferenceStreamError {
+		t.Fatalf("successful attempt retained a prior attempt's inference flags: %+v", stats)
+	}
 }
 
 // TestCreateOptimisedTransport_ConnectionLimits verifies that both MaxConnsPerHost and

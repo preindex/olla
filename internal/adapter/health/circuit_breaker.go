@@ -41,6 +41,18 @@ func NewCircuitBreaker() *CircuitBreaker {
 	}
 }
 
+// RetainEndpoints drops circuit state for endpoints no longer present in the
+// current discovery snapshot. Dynamic tasks use incarnation keys, so this
+// also bounds state across repeated Swarm reschedules.
+func (cb *CircuitBreaker) RetainEndpoints(keys map[string]struct{}) {
+	cb.endpoints.Range(func(key string, _ *resilience.Breaker) bool {
+		if _, ok := keys[key]; !ok {
+			cb.endpoints.Delete(key)
+		}
+		return true
+	})
+}
+
 // probeStaleness derives the half-open single-flight staleness window from
 // the endpoint's own CheckTimeout, rather than a single fixed constant: this
 // CircuitBreaker is shared across every endpoint (one xsync.Map keyed by

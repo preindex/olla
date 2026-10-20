@@ -106,6 +106,27 @@ func TestStickySessionWrapper_Hit(t *testing.T) {
 	assert.Equal(t, "hit", outcome2.Result)
 }
 
+func TestStickySessionWrapper_RepinsWhenTaskIncarnationChangesAtSameURL(t *testing.T) {
+	w := makeWrapper(t, defaultStickyConfig())
+	oldTask := makeEndpoint("task-old", "http://backend:11434")
+	oldTask.DiscoveryIdentity = "swarm:task-old"
+	ctx, _ := injectKey(context.Background(), "sess-rescheduled:llama", "session_header")
+	if _, err := w.Select(ctx, []*domain.Endpoint{oldTask}); err != nil {
+		t.Fatal(err)
+	}
+
+	newTask := makeEndpoint("task-new", oldTask.URLString)
+	newTask.DiscoveryIdentity = "swarm:task-new"
+	ctx, outcome := injectKey(context.Background(), "sess-rescheduled:llama", "session_header")
+	selected, err := w.Select(ctx, []*domain.Endpoint{newTask})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.DiscoveryIdentity != newTask.DiscoveryIdentity || outcome.Result != "repin" {
+		t.Fatalf("replacement task inherited stale sticky pin: selected=%q result=%q", selected.DiscoveryIdentity, outcome.Result)
+	}
+}
+
 func TestStickySessionWrapper_Repin(t *testing.T) {
 	t.Parallel()
 

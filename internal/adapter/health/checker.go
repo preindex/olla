@@ -177,6 +177,11 @@ func (c *HTTPHealthChecker) performHealthChecks(ctx context.Context) {
 			"error", domain.NewEndpointError("get_endpoints", "repository", err))
 		return
 	}
+	activeCircuitKeys := make(map[string]struct{}, len(endpoints))
+	for _, endpoint := range endpoints {
+		activeCircuitKeys[healthCircuitKey(endpoint, endpoint.GetHealthCheckURLString())] = struct{}{}
+	}
+	c.healthClient.circuitBreaker.RetainEndpoints(activeCircuitKeys)
 
 	now := time.Now()
 	var wg sync.WaitGroup

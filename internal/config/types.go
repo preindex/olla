@@ -26,16 +26,17 @@ type Config struct {
 	//       - gpt-oss:120b
 	//       - gpt-oss-120b-MLX
 	//       - gguf_gpt_oss_120b.gguf
-	ModelAliases  map[string][]string `yaml:"model_aliases,omitempty"`
-	Logging       LoggingConfig       `yaml:"logging"`
-	Filename      string              `yaml:"-"`
-	Dashboard     DashboardConfig     `yaml:"dashboard"`
-	Translators   TranslatorsConfig   `yaml:"translators"`
-	ModelRegistry ModelRegistryConfig `yaml:"model_registry"`
-	Discovery     DiscoveryConfig     `yaml:"discovery"`
-	Proxy         ProxyConfig         `yaml:"proxy"`
-	Server        ServerConfig        `yaml:"server"`
-	Engineering   EngineeringConfig   `yaml:"engineering"`
+	ModelAliases    map[string][]string   `yaml:"model_aliases,omitempty"`
+	Logging         LoggingConfig         `yaml:"logging"`
+	Filename        string                `yaml:"-"`
+	Dashboard       DashboardConfig       `yaml:"dashboard"`
+	Translators     TranslatorsConfig     `yaml:"translators"`
+	ModelRegistry   ModelRegistryConfig   `yaml:"model_registry"`
+	Discovery       DiscoveryConfig       `yaml:"discovery"`
+	Proxy           ProxyConfig           `yaml:"proxy"`
+	Server          ServerConfig          `yaml:"server"`
+	InferenceHealth InferenceHealthConfig `yaml:"inference_health"`
+	Engineering     EngineeringConfig     `yaml:"engineering"`
 }
 
 // CorsConfig controls browser cross-origin access to the Olla API.
@@ -259,8 +260,9 @@ type ProxyConfig struct {
 type DiscoveryConfig struct {
 	Type            string                `yaml:"type"` // Only "static" is implemented
 	Static          StaticDiscoveryConfig `yaml:"static"`
-	RefreshInterval time.Duration         `yaml:"refresh_interval"`
+	Swarm           SwarmDiscoveryConfig  `yaml:"swarm"`
 	ModelDiscovery  ModelDiscoveryConfig  `yaml:"model_discovery"`
+	RefreshInterval time.Duration         `yaml:"refresh_interval"`
 }
 
 // ModelDiscoveryConfig holds model discvery specific settings

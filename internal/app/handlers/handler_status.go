@@ -111,17 +111,19 @@ type SecurityViolation struct {
 	SizeLimits int64 `json:"size_limits"`
 }
 type StatusResponse struct {
-	Timestamp time.Time          `json:"timestamp"`
-	Proxy     ProxySummary       `json:"proxy"`
-	Endpoints []EndpointResponse `json:"endpoints"`
-	Security  SecuritySummary    `json:"security"`
-	System    SystemSummary      `json:"system"`
+	Timestamp time.Time              `json:"timestamp"`
+	Inference *ports.InferenceHealth `json:"inference,omitempty"`
+	Proxy     ProxySummary           `json:"proxy"`
+	Endpoints []EndpointResponse     `json:"endpoints"`
+	Security  SecuritySummary        `json:"security"`
+	System    SystemSummary          `json:"system"`
 }
 
 type statusSnapshot struct {
 	endpointStats   map[string]ports.EndpointStats
 	connectionStats map[string]int64
 	endpointModels  map[string]*domain.EndpointModels
+	inferenceHealth *ports.InferenceHealth
 	all             []*domain.Endpoint
 	healthy         []*domain.Endpoint
 	proxyStats      ports.ProxyStats
@@ -144,12 +146,17 @@ func (a *Application) gatherStatusSnapshot(ctx context.Context) (*statusSnapshot
 	var proxyStats ports.ProxyStats
 	var securityStats ports.SecurityStats
 	var connectionStats map[string]int64
+	var inferenceHealth *ports.InferenceHealth
 
 	if a.statsCollector != nil {
 		endpointStats = a.statsCollector.GetEndpointStats()
 		proxyStats = a.statsCollector.GetProxyStats()
 		securityStats = a.statsCollector.GetSecurityStats()
 		connectionStats = a.statsCollector.GetConnectionStats()
+		if collector, ok := a.statsCollector.(ports.InferenceHealthCollector); ok && a.Config.InferenceHealth.Enabled {
+			health := collector.GetInferenceHealth(a.inferenceAvailability(ctx, all), time.Now())
+			inferenceHealth = &health
+		}
 	}
 
 	return &statusSnapshot{
@@ -160,6 +167,7 @@ func (a *Application) gatherStatusSnapshot(ctx context.Context) (*statusSnapshot
 		securityStats:   securityStats,
 		connectionStats: connectionStats,
 		endpointModels:  endpointModelsMap,
+		inferenceHealth: inferenceHealth,
 	}, nil
 }
 
@@ -176,6 +184,7 @@ func (a *Application) buildStatusResponse(snapshot *statusSnapshot) StatusRespon
 	endpointIDs := buildEndpointIDs(snapshot.all)
 	a.buildUnifiedEndpoints(snapshot.all, snapshot.endpointStats, snapshot.connectionStats, response.Endpoints, snapshot.endpointModels, endpointIDs)
 	response.Security = a.buildSecuritySummary(snapshot.securityStats)
+	response.Inference = snapshot.inferenceHealth
 
 	return response
 }

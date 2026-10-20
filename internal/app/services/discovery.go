@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync/atomic"
+	"time"
 
 	"github.com/thushan/olla/internal/adapter/discovery"
 	"github.com/thushan/olla/internal/adapter/health"
@@ -29,6 +30,7 @@ type DiscoveryService struct {
 	statsService   *StatsService
 	logger         logger.StyledLogger
 	modelDiscovery *discovery.ModelDiscoveryService
+	swarmDiscovery *discovery.SwarmDiscoveryService
 	registry       domain.ModelRegistry
 	endpointRepo   domain.EndpointRepository
 	// purgeDeadFn, when set, is called with the current routable endpoint list
@@ -92,15 +94,16 @@ func (s *DiscoveryService) Start(ctx context.Context) error {
 		}
 	}
 
-	switch s.config.Type {
-	case "static":
-		staticRepo := discovery.NewStaticEndpointRepository()
-		if err := staticRepo.LoadFromConfig(ctx, s.config.Static.Endpoints); err != nil {
-			return fmt.Errorf("failed to load endpoints from config: %w", err)
-		}
-		s.endpointRepo = staticRepo
-	default:
+	if s.config.Type != "static" {
 		return fmt.Errorf("unsupported discovery type: %s", s.config.Type)
+	}
+	staticRepo := discovery.NewStaticEndpointRepository()
+	if err := staticRepo.LoadFromConfig(ctx, s.config.Static.Endpoints); err != nil {
+		return fmt.Errorf("failed to load endpoints from config: %w", err)
+	}
+	s.endpointRepo = staticRepo
+	if err := s.configureSwarmDiscovery(ctx, staticRepo); err != nil {
+		return err
 	}
 
 	s.healthChecker = health.NewHTTPHealthCheckerWithDefaults(s.endpointRepo, s.logger)
@@ -189,10 +192,62 @@ func (s *DiscoveryService) Start(ctx context.Context) error {
 		}
 	}
 
+	if s.swarmDiscovery != nil {
+		s.swarmDiscovery.Start(ctx)
+	}
+
 	s.logger.Info("Discovery service initialised",
 		"type", s.config.Type,
 		"endpoints", len(endpoints))
 
+	return nil
+}
+
+func (s *DiscoveryService) configureSwarmDiscovery(ctx context.Context, staticRepo *discovery.StaticEndpointRepository) error {
+	if !s.config.Swarm.Enabled {
+		return nil
+	}
+	manager, err := discovery.NewSwarmManagerClient(s.config.Swarm.Socket, s.config.Swarm.APIVersion, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to create Swarm manager client: %w", err)
+	}
+	swarmRepo := discovery.NewSwarmEndpointRepository(s.config.Swarm, s.registry)
+	swarmDiscovery := discovery.NewSwarmDiscoveryService(
+		manager, swarmRepo, s.config.Swarm.Service, s.config.Swarm.Network,
+		s.config.Swarm.Port, s.config.Swarm.RefreshInterval, s.logger,
+		s.onSwarmEndpointChange,
+	)
+	staticEndpoints, err := staticRepo.GetAll(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to read configured endpoints before Swarm discovery: %w", err)
+	}
+	swarmDiscovery.ExcludeStaticEndpoints(staticEndpoints)
+	// An initial API failure leaves the dynamic repository empty. Periodic
+	// reconciliation will retry; failed calls never erase a good snapshot.
+	if err := swarmDiscovery.Reconcile(ctx); err != nil {
+		s.logger.Warn("Initial Swarm discovery failed; retrying in background", "error", err)
+	}
+	s.endpointRepo = discovery.NewCompositeEndpointRepository(staticRepo, swarmRepo)
+	s.swarmDiscovery = swarmDiscovery
+	return nil
+}
+
+func (s *DiscoveryService) onSwarmEndpointChange(ctx context.Context, added bool) error {
+	if added && s.healthChecker != nil {
+		if err := s.healthChecker.RunHealthCheck(ctx, true); err != nil {
+			s.logger.Warn("Initial health check after Swarm task change failed", "error", err)
+		}
+	}
+	if s.modelDiscovery != nil && added {
+		if err := s.modelDiscovery.DiscoverAll(ctx); err != nil {
+			s.logger.Warn("Model discovery after Swarm task change failed", "error", err)
+		}
+	}
+	if fn := s.purgeDeadFn.Load(); fn != nil && s.endpointRepo != nil {
+		if routable, err := s.endpointRepo.GetRoutable(ctx); err == nil {
+			(*fn)(routable)
+		}
+	}
 	return nil
 }
 
@@ -204,6 +259,13 @@ func (s *DiscoveryService) Stop(ctx context.Context) error {
 		s.logger.ResetLine()
 		s.logger.InfoWithStatus("Stopping discovery service", "OK")
 	}()
+	var stopErr error
+	if s.swarmDiscovery != nil {
+		if err := s.swarmDiscovery.Stop(ctx); err != nil {
+			s.logger.Warn("  Failed to stop Swarm discovery", "error", err)
+			stopErr = fmt.Errorf("failed to stop Swarm discovery: %w", err)
+		}
+	}
 	if s.healthChecker != nil {
 		if err := s.healthChecker.StopChecking(ctx); err != nil {
 			s.logger.Warn("  Failed to stop health checker", "error", err)
@@ -215,7 +277,7 @@ func (s *DiscoveryService) Stop(ctx context.Context) error {
 			s.logger.Warn("  Failed to stop model discovery", "error", err)
 		}
 	}
-	return nil
+	return stopErr
 }
 
 // Dependencies returns service dependencies
@@ -273,8 +335,10 @@ func (s *DiscoveryService) GetEndpoints(ctx context.Context) ([]*domain.Endpoint
 
 // RefreshEndpoints implements ports.DiscoveryService
 func (s *DiscoveryService) RefreshEndpoints(ctx context.Context) error {
-	// For static discovery, endpoints don't change, so this is a no-op
-	// In a dynamic discovery implementation, this would refresh from the discovery source
+	if s.swarmDiscovery != nil {
+		return s.swarmDiscovery.Reconcile(ctx)
+	}
+	// Static endpoints don't change at runtime.
 	return nil
 }
 

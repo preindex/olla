@@ -87,6 +87,12 @@ func (a *Application) executePassthroughRequest(
 
 	// Execute proxy
 	err = a.proxyService.ProxyRequestToEndpoints(ctx, w, r, endpoints, pr.stats, pr.requestLogger)
+	pr.stats.InferenceTimedOut = pr.stats.InferenceTimedOut || isInferenceTimeout(err)
+	if err != nil && pr.isStreaming {
+		if pr != nil && pr.stats != nil {
+			pr.stats.InferenceStreamError = true
+		}
+	}
 	pr.captureStickyOutcome(ctx, r)
 	a.logRequestResult(pr, err)
 
@@ -252,6 +258,10 @@ func (a *Application) executeTranslationRequest(
 	a.logRequestResult(pr, proxyErr)
 
 	if proxyErr != nil {
+		pr.stats.InferenceTimedOut = pr.stats.InferenceTimedOut || isInferenceTimeout(proxyErr)
+		if transformedReq.IsStreaming {
+			pr.stats.InferenceStreamError = true
+		}
 		// only write error if response hasn't started
 		if w.Header().Get(constants.HeaderContentType) == "" {
 			a.writeTranslatorError(w, trans, pr, fmt.Errorf("proxy error: %w", proxyErr), http.StatusBadGateway)
@@ -331,7 +341,10 @@ func (a *Application) translationHandler(trans translator.RequestTranslator) htt
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
+		outcomeWriter := newInferenceOutcomeWriter(w)
+		w = outcomeWriter
 		pr := a.initializeProxyRequest(r)
+		defer a.recordInferenceOutcome(r.Context(), pr, outcomeWriter)
 		ctx, r := a.setupRequestContext(r, pr.stats)
 
 		// Buffer body once -- both passthrough and translation paths need it.
@@ -384,6 +397,7 @@ func (a *Application) translationHandler(trans translator.RequestTranslator) htt
 		// Get compatible endpoints for this request
 		endpoints, err := a.getCompatibleEndpoints(ctx, pr)
 		if err != nil {
+			pr.stats.InferenceNoRouting = true
 			a.writeTranslatorError(w, trans, pr, errors.New("no healthy endpoints available"), http.StatusServiceUnavailable)
 			a.recordTranslatorMetrics(trans, pr, constants.TranslatorModeTranslation, constants.FallbackReasonNoCompatibleEndpoints)
 			return
@@ -412,6 +426,7 @@ func (a *Application) translationHandler(trans translator.RequestTranslator) htt
 				pr.stats.RoutingDecision = decision
 				a.setRoutingDecisionHeaders(w, decision)
 			}
+			pr.stats.InferenceNoRouting = status >= http.StatusServiceUnavailable || decision == nil
 
 			// Headers must be set before writeTranslatorError, which calls WriteHeader.
 			a.setStickyResponseHeadersFromRequest(w, r)
@@ -768,6 +783,9 @@ func (a *Application) handleStreamingPanic(
 	trans translator.RequestTranslator,
 ) {
 	if r := recover(); r != nil {
+		if pr != nil && pr.stats != nil {
+			pr.stats.InferenceStreamError = true
+		}
 		// Close both ends of the pipe to unblock the proxy goroutine.
 		pipeReader.Close()
 		pipeWriter.Close()

@@ -38,9 +38,44 @@ server:         # HTTP server configuration
 proxy:          # Proxy engine settings
 discovery:      # Endpoint discovery
 model_registry: # Model management
+inference_health: # Request-oriented inference health summaries
 translators:    # API translation (e.g., Anthropic ↔ OpenAI)
 logging:        # Logging configuration
 engineering:    # Debug features
+```
+
+## Inference Health
+
+`/internal/status` includes an additive `inference` object with recent request outcomes for the whole proxy and for each known or recently used model. This view counts one final outcome per client request, so retries do not inflate the sample. It does not change `/internal/health`, which remains a liveness check.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `inference_health.enabled` | bool | `true` | Include the inference health object in `/internal/status` |
+| `inference_health.window` | duration | `5m` | Recent outcome window from `1s` to `24h`; counts use bounded buckets up to one second at the default window |
+| `inference_health.min_observations` | int | `10` | Minimum counted outcomes before applying thresholds |
+| `inference_health.degraded_failure_rate` | fraction | `0.05` | Degraded threshold; `0.05` means 5% |
+| `inference_health.critical_failure_rate` | fraction | `0.10` | Critical threshold; `0.10` means 10% |
+| `inference_health.latency_objective` | duration | `0s` | Optional average successful-request latency objective; `0s` disables it |
+
+Failure-rate thresholds include gateway or upstream 5xx responses, timeouts, routing rejections, upstream 429 responses, and explicit stream errors. Client 4xx responses and cancellations are excluded. Upstream 429 counts are separate from local rate-limit rejections. Per-model entries include current routing availability, so aggregate health cannot hide a model-specific failure. `state` is `insufficient_data` until the sample minimum is met, `idle` after prior observations age out, or `unavailable` when a known model has no routable endpoint. For unavailable models, `request_status` retains the observed request health classification. Models with no discovery information are reported with unknown availability.
+
+Outcome history retains up to 500 recently used models. Current catalogue models
+remain visible even if their request history was evicted; `models_truncated`
+reports that history eviction occurred. Counts expire in buckets of one second
+at the default window, growing to at most one minute for larger windows, so
+expiry can lag by one bucket. An overall `healthy` status describes aggregate
+request outcomes and does not assert that every model is healthy.
+
+Example:
+
+```yaml
+inference_health:
+  enabled: true
+  window: 5m
+  min_observations: 10
+  degraded_failure_rate: 0.05
+  critical_failure_rate: 0.10
+  latency_objective: 0s
 ```
 
 ## Server Configuration
@@ -286,7 +321,7 @@ Endpoint discovery and health checking.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `type` | string | `"static"` | Discovery type (only `static` supported) |
+| `type` | string | `"static"` | Discovery mode (`static` is the supported base mode) |
 | `refresh_interval` | duration | `30s` | Discovery refresh interval |
 
 Example:

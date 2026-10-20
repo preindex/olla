@@ -107,7 +107,7 @@ func (s *StickySessionWrapper) Select(ctx context.Context, endpoints []*domain.E
 	if item != nil {
 		pinnedURL := item.Value()
 		for _, ep := range endpoints {
-			if ep.Status.IsRoutable() && ep.URLString == pinnedURL {
+			if ep.Status.IsRoutable() && ep.Key() == pinnedURL {
 				// Sticky hit — backend is still alive and serving this model.
 				if outcome != nil {
 					outcome.Result = "hit"
@@ -125,7 +125,7 @@ func (s *StickySessionWrapper) Select(ctx context.Context, endpoints []*domain.E
 	}
 
 	// Record the affinity mapping for future turns.
-	s.store.Set(key, chosen.URLString, ttlcache.DefaultTTL)
+	s.store.Set(key, chosen.Key(), ttlcache.DefaultTTL)
 
 	result := "miss"
 	if item != nil {
@@ -147,7 +147,7 @@ func (s *StickySessionWrapper) Select(ctx context.Context, endpoints []*domain.E
 func (s *StickySessionWrapper) PurgeDeadEndpoints(routable []*domain.Endpoint) {
 	alive := make(map[string]struct{}, len(routable))
 	for _, ep := range routable {
-		alive[ep.URLString] = struct{}{}
+		alive[ep.Key()] = struct{}{}
 	}
 
 	s.store.Range(func(item *ttlcache.Item[string, string]) bool {

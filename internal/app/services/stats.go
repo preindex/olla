@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/thushan/olla/internal/adapter/stats"
+	"github.com/thushan/olla/internal/config"
 	"github.com/thushan/olla/internal/core/ports"
 	"github.com/thushan/olla/internal/logger"
 )
@@ -13,14 +14,20 @@ import (
 // It initialises early in the startup sequence as most other services depend on it
 // for instrumentation and observability.
 type StatsService struct {
-	collector ports.StatsCollector
-	logger    logger.StyledLogger
+	collector             ports.StatsCollector
+	logger                logger.StyledLogger
+	inferenceHealthConfig config.InferenceHealthConfig
 }
 
 // NewStatsService creates a new stats service
-func NewStatsService(logger logger.StyledLogger) *StatsService {
+func NewStatsService(logger logger.StyledLogger, inferenceHealthConfig ...config.InferenceHealthConfig) *StatsService {
+	healthConfig := config.DefaultInferenceHealthConfig()
+	if len(inferenceHealthConfig) > 0 {
+		healthConfig = inferenceHealthConfig[0]
+	}
 	return &StatsService{
-		logger: logger,
+		logger:                logger,
+		inferenceHealthConfig: healthConfig,
 	}
 }
 
@@ -33,7 +40,7 @@ func (s *StatsService) Name() string {
 func (s *StatsService) Start(ctx context.Context) error {
 	s.logger.Info("Initialising stats collector")
 
-	s.collector = stats.NewCollector(s.logger)
+	s.collector = stats.NewCollectorWithConfigs(s.logger, nil, s.inferenceHealthConfig)
 
 	s.logger.Info("Stats collector initialised")
 	return nil

@@ -40,7 +40,7 @@ func CreateAndStartServiceManager(ctx context.Context, cfg *config.Config, logge
 // registration followed by dependency injection. This pattern allows circular dependency
 // resolution and ensures services can reference each other without initialisation races.
 func registerServices(manager *services.ServiceManager, cfg *config.Config, logger logger.StyledLogger) error {
-	statsService := services.NewStatsService(logger)
+	statsService := services.NewStatsService(logger, cfg.InferenceHealth)
 	if err := manager.Register(statsService); err != nil {
 		return fmt.Errorf("failed to register stats service: %w", err)
 	}

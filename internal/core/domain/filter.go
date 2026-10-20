@@ -9,6 +9,9 @@ import (
 // FilterConfig represents the configuration for filtering items
 // using include and exclude patterns with glob support
 type FilterConfig struct {
+
+	// ParameterRange constrains discovered models by their declared parameter count.
+	ParameterRange *ParameterRange `yaml:"parameter_range,omitempty" json:"parameter_range,omitempty"`
 	// Include patterns - items matching any of these patterns are included
 	// If empty or contains "*", all items are initially included
 	Include []string `yaml:"include,omitempty" json:"include,omitempty"`
@@ -37,10 +40,11 @@ type FilterStats struct {
 	RejectedCount int `json:"rejected_count"`
 }
 
-// IsEmpty returns true if no filter patterns are configured
+// IsEmpty returns true if no filter rules are configured
 func (fc *FilterConfig) IsEmpty() bool {
 	return (fc.Include == nil || len(fc.Include) == 0) &&
-		(fc.Exclude == nil || len(fc.Exclude) == 0)
+		(fc.Exclude == nil || len(fc.Exclude) == 0) &&
+		(fc.ParameterRange == nil || (fc.ParameterRange.MinB == nil && fc.ParameterRange.MaxB == nil))
 }
 
 // HasIncludeAll returns true if the include patterns would include everything
@@ -60,6 +64,9 @@ func (fc *FilterConfig) HasIncludeAll() bool {
 
 // Validate checks if the filter configuration is valid
 func (fc *FilterConfig) Validate() error {
+	if err := fc.ValidateParameterRange(); err != nil {
+		return err
+	}
 	// Check for invalid patterns
 	for _, pattern := range fc.Include {
 		if err := validatePattern(pattern); err != nil {
@@ -116,6 +123,9 @@ func (fc *FilterConfig) Clone() *FilterConfig {
 	}
 
 	clone := &FilterConfig{}
+	if fc.ParameterRange != nil {
+		clone.ParameterRange = fc.ParameterRange.Clone()
+	}
 
 	if fc.Include != nil {
 		clone.Include = make([]string, len(fc.Include))
@@ -141,6 +151,26 @@ func (fc *FilterConfig) Merge(other *FilterConfig) *FilterConfig {
 	}
 
 	merged := &FilterConfig{}
+	if fc.ParameterRange != nil || other.ParameterRange != nil {
+		var left, right *ParameterRange
+		if fc.ParameterRange != nil {
+			left = fc.ParameterRange
+		}
+		if other.ParameterRange != nil {
+			right = other.ParameterRange
+		}
+		var leftMin, leftMax, rightMin, rightMax *float64
+		if left != nil {
+			leftMin, leftMax = left.MinB, left.MaxB
+		}
+		if right != nil {
+			rightMin, rightMax = right.MinB, right.MaxB
+		}
+		merged.ParameterRange = &ParameterRange{
+			MinB: mergeLowerBound(leftMin, rightMin),
+			MaxB: mergeUpperBound(leftMax, rightMax),
+		}
+	}
 
 	// For Include: combine both (union of inclusions)
 	includeMap := make(map[string]bool)

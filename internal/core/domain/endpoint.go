@@ -19,8 +19,11 @@ const (
 )
 
 type Endpoint struct {
-	LastChecked   time.Time
-	NextCheckTime time.Time
+	// DiscoveryIdentity distinguishes dynamic endpoint incarnations when an IP
+	// address is reused. It is internal and never exposed in API responses.
+	DiscoveryIdentity string `json:"-"`
+	LastChecked       time.Time
+	NextCheckTime     time.Time
 	// RateLimitedUntil is set when a health probe receives 429. The scheduler skips
 	// probing this endpoint until the time passes. Never serialised.
 	RateLimitedUntil time.Time `json:"-"`
@@ -55,6 +58,19 @@ type Endpoint struct {
 }
 
 func (e *Endpoint) GetURLString() string {
+	return e.URLString
+}
+
+// Key returns the identity used for endpoint-scoped in-memory state. Static
+// endpoints retain their historical URL key; dynamic endpoints are fenced by
+// their discovery incarnation so a rescheduled task cannot inherit old state.
+func (e *Endpoint) Key() string {
+	if e == nil {
+		return ""
+	}
+	if e.DiscoveryIdentity != "" {
+		return e.DiscoveryIdentity
+	}
 	return e.URLString
 }
 

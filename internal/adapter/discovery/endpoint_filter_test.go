@@ -160,6 +160,25 @@ func TestDiscoveryServiceEndpointFiltering(t *testing.T) {
 			},
 			expectedModels: []string{"model1", "model2", "model3"},
 		},
+		{
+			name: "parameter range uses structured parameter metadata and composes with globs",
+			endpoint: &domain.Endpoint{
+				Name:      "parameter-range-endpoint",
+				URLString: "http://localhost:11437",
+				ModelFilter: &domain.FilterConfig{
+					Include:        []string{"llama*"},
+					ParameterRange: &domain.ParameterRange{MinB: floatPtr(7), MaxB: floatPtr(13)},
+				},
+			},
+			discoveredModels: []*domain.ModelInfo{
+				{Name: "llama-7b", Details: &domain.ModelDetails{ParameterSize: stringPtr("7B")}},
+				{Name: "llama-13b", Details: &domain.ModelDetails{ParameterSize: stringPtr("13B")}},
+				{Name: "llama-14b", Details: &domain.ModelDetails{ParameterSize: stringPtr("14B")}},
+				{Name: "llama-unknown"},
+				{Name: "qwen-8b", Details: &domain.ModelDetails{ParameterSize: stringPtr("8B")}},
+			},
+			expectedModels: []string{"llama-7b", "llama-13b"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -214,6 +233,32 @@ func TestDiscoveryServiceEndpointFiltering(t *testing.T) {
 				"Registered models should match expected after filtering")
 		})
 	}
+}
+
+func stringPtr(value string) *string  { return &value }
+func floatPtr(value float64) *float64 { return &value }
+
+func TestDiscoveryServiceInvalidParameterRangeDoesNotFailOpen(t *testing.T) {
+	min, max := 10.0, 5.0
+	endpoint := &domain.Endpoint{
+		Name:      "invalid-range-endpoint",
+		URLString: "http://localhost:11438",
+		ModelFilter: &domain.FilterConfig{
+			ParameterRange: &domain.ParameterRange{MinB: &min, MaxB: &max},
+		},
+	}
+	registered := make(map[string][]*domain.ModelInfo)
+	service := NewModelDiscoveryService(
+		&mockDiscoveryClientWithModels{models: []*domain.ModelInfo{{Name: "llama-7b", Details: &domain.ModelDetails{ParameterSize: stringPtr("7B")}}}},
+		&mockEndpointRepository{},
+		&mockModelRegistryWithCapture{registeredModels: registered},
+		DiscoveryConfig{Timeout: 10 * time.Second},
+		logger.NewPlainStyledLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))),
+	)
+
+	err := service.DiscoverEndpoint(context.Background(), endpoint)
+	require.Error(t, err)
+	assert.NotContains(t, registered, endpoint.URLString, "invalid range must not register unfiltered models")
 }
 
 func TestGetEndpointFilterConfig(t *testing.T) {

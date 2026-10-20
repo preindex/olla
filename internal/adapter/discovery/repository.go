@@ -300,6 +300,11 @@ func (r *StaticEndpointRepository) validateEndpointConfig(cfg config.EndpointCon
 	if cfg.URL == "" {
 		return errors.New("endpoint URL cannot be empty")
 	}
+	if cfg.ModelFilter != nil {
+		if err := cfg.ModelFilter.Validate(); err != nil {
+			return fmt.Errorf("invalid model filter: %w", err)
+		}
+	}
 
 	// Reject embedded credentials (user:pass@host). url.URL.String() preserves
 	// userinfo verbatim, so without this check a credentialed URL would flow

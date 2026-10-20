@@ -133,9 +133,11 @@ func (s *ModelDiscoveryService) DiscoverAll(ctx context.Context) error {
 	}
 
 	if len(endpoints) == 0 {
+		s.pruneEndpointState(nil)
 		s.logger.Debug("No healthy endpoints available for discovery")
 		return nil
 	}
+	s.pruneEndpointState(endpoints)
 
 	// Failed endpoints are retried once their cooldown expires.
 	activeEndpoints := s.filterActiveEndpoints(endpoints)
@@ -178,6 +180,9 @@ func (s *ModelDiscoveryService) DiscoverEndpoint(ctx context.Context, endpoint *
 		filteredModels, err = s.applyModelFilter(ctx, models, filterConfig)
 		if err != nil {
 			s.logger.ErrorWithEndpoint("Failed to apply model filter", endpoint.Name, "error", err)
+			if filterConfig.ParameterRange != nil && (filterConfig.ParameterRange.MinB != nil || filterConfig.ParameterRange.MaxB != nil) {
+				return fmt.Errorf("failed to apply parameter range filter: %w", err)
+			}
 			// Continue with unfiltered models rather than failing completely
 			filteredModels = models
 		} else if len(filteredModels) < len(models) {
@@ -187,22 +192,27 @@ func (s *ModelDiscoveryService) DiscoverEndpoint(ctx context.Context, endpoint *
 		}
 	}
 
-	// Check if registry supports endpoint registration
-	if unifiedRegistry, ok := s.modelRegistry.(*registry.UnifiedMemoryModelRegistry); ok {
-		// Use the new method that accepts endpoint objects
-		if err := unifiedRegistry.RegisterModelsWithEndpoint(ctx, endpoint, filteredModels); err != nil {
+	// Keep task removal/replacement ordered with registry publication. A worker
+	// for an old task must not restore models after its IP has been reused.
+	publish := func() error {
+		if unifiedRegistry, ok := s.modelRegistry.(*registry.UnifiedMemoryModelRegistry); ok {
+			return unifiedRegistry.RegisterModelsWithEndpoint(ctx, endpoint, filteredModels)
+		}
+		return s.modelRegistry.RegisterModels(ctx, endpoint.URLString, filteredModels)
+	}
+	if fenced, ok := s.endpointRepo.(interface {
+		WithCurrentEndpoint(*domain.Endpoint, func() error) error
+	}); ok {
+		if err := fenced.WithCurrentEndpoint(endpoint, publish); err != nil {
 			s.logger.ErrorWithEndpoint("Failed to register discovered models", endpoint.Name, "error", err)
 			return fmt.Errorf("failed to register models: %w", err)
 		}
-	} else {
-		// Fall back to string-based registration
-		if err := s.modelRegistry.RegisterModels(ctx, endpoint.URLString, filteredModels); err != nil {
-			s.logger.ErrorWithEndpoint("Failed to register discovered models", endpoint.Name, "error", err)
-			return fmt.Errorf("failed to register models: %w", err)
-		}
+	} else if err := publish(); err != nil {
+		s.logger.ErrorWithEndpoint("Failed to register discovered models", endpoint.Name, "error", err)
+		return fmt.Errorf("failed to register models: %w", err)
 	}
 
-	s.resetFailureCount(endpoint.URLString)
+	s.resetFailureCount(endpoint.Key())
 	s.logger.InfoWithEndpoint(" ", endpoint.Name, "models", len(filteredModels))
 	return nil
 }
@@ -253,16 +263,16 @@ func (s *ModelDiscoveryService) handleDiscoveryError(endpoint *domain.Endpoint, 
 
 	if !IsRecoverable(err) {
 		s.logger.WarnWithEndpoint("Pausing discovery for endpoint until cooldown expires", endpoint.Name)
-		s.disableEndpoint(endpoint.URLString)
+		s.disableEndpoint(endpoint.Key())
 		return
 	}
 
-	s.incrementFailureCount(endpoint.URLString)
+	s.incrementFailureCount(endpoint.Key())
 
-	failureCount := s.getFailureCount(endpoint.URLString)
+	failureCount := s.getFailureCount(endpoint.Key())
 	if failureCount >= MaxConsecutiveFailures {
 		s.logger.WarnWithEndpoint("Pausing discovery for endpoint after consecutive failures", endpoint.Name, "failures", failureCount)
-		s.disableEndpoint(endpoint.URLString)
+		s.disableEndpoint(endpoint.Key())
 	}
 }
 
@@ -277,7 +287,7 @@ func (s *ModelDiscoveryService) filterActiveEndpoints(endpoints []*domain.Endpoi
 
 	active := make([]*domain.Endpoint, 0, len(endpoints))
 	for _, endpoint := range endpoints {
-		if failureCount, exists := s.disabledEndpoints[endpoint.URLString]; !exists || failureCount < MaxConsecutiveFailures || !time.Now().Before(s.retryAfter[endpoint.URLString]) {
+		if failureCount, exists := s.disabledEndpoints[endpoint.Key()]; !exists || failureCount < MaxConsecutiveFailures || !time.Now().Before(s.retryAfter[endpoint.Key()]) {
 			active = append(active, endpoint)
 		}
 	}
@@ -382,6 +392,23 @@ func (s *ModelDiscoveryService) getEndpointFilterConfig(endpoint *domain.Endpoin
 	return nil
 }
 
+// pruneEndpointState discards retry state for removed task incarnations so a
+// long-running service does not accumulate entries as Swarm reschedules tasks.
+func (s *ModelDiscoveryService) pruneEndpointState(endpoints []*domain.Endpoint) {
+	active := make(map[string]struct{}, len(endpoints))
+	for _, endpoint := range endpoints {
+		active[endpoint.Key()] = struct{}{}
+	}
+	s.mu.Lock()
+	for key := range s.disabledEndpoints {
+		if _, ok := active[key]; !ok {
+			delete(s.disabledEndpoints, key)
+			delete(s.retryAfter, key)
+		}
+	}
+	s.mu.Unlock()
+}
+
 // applyModelFilter applies filtering to discovered models
 func (s *ModelDiscoveryService) applyModelFilter(ctx context.Context, models []*domain.ModelInfo, filterConfig *domain.FilterConfig) ([]*domain.ModelInfo, error) {
 	if filterConfig == nil || filterConfig.IsEmpty() {
@@ -404,7 +431,9 @@ func (s *ModelDiscoveryService) applyModelFilter(ctx context.Context, models []*
 	filtered := make([]*domain.ModelInfo, 0, len(result.Accepted))
 	for _, item := range result.Accepted {
 		if model, ok := item.(*domain.ModelInfo); ok {
-			filtered = append(filtered, model)
+			if filterConfig.MatchesParameterRange(model) {
+				filtered = append(filtered, model)
+			}
 		}
 	}
 

@@ -45,7 +45,10 @@ type proxyRequest struct {
 }
 
 func (a *Application) proxyHandler(w http.ResponseWriter, r *http.Request) {
+	outcomeWriter := newInferenceOutcomeWriter(w)
+	w = outcomeWriter
 	pr := a.initializeProxyRequest(r)
+	defer a.recordInferenceOutcome(r.Context(), pr, outcomeWriter)
 
 	ctx, r := a.setupRequestContext(r, pr.stats)
 
@@ -93,6 +96,10 @@ func (a *Application) dispatchToEndpoints(ctx context.Context, w http.ResponseWr
 	tracker := core.NewResponseStartedWriter(w)
 
 	err := a.executeProxyRequest(ctx, tracker, r, endpoints, pr)
+	pr.stats.InferenceTimedOut = pr.stats.InferenceTimedOut || isInferenceTimeout(err)
+	if err != nil && tracker.Started() {
+		pr.stats.InferenceStreamError = true
+	}
 	pr.captureStickyOutcome(ctx, r)
 	a.logRequestResult(pr, err)
 
@@ -130,6 +137,7 @@ func (a *Application) writeNoRoutableEndpoints(w http.ResponseWriter, r *http.Re
 		status = http.StatusServiceUnavailable
 		reason = "no healthy endpoints available"
 	}
+	pr.stats.InferenceNoRouting = status >= http.StatusServiceUnavailable || (providerType != "" && decision == nil)
 
 	// Preserve normal request telemetry (client_ip, model, duration, routing fields)
 	// even though we're short-circuiting before the proxy engine ever runs. Logged as
@@ -560,6 +568,8 @@ func (a *Application) buildLogFields(pr *proxyRequest, duration time.Duration) [
 }
 
 func (a *Application) handleEndpointError(w http.ResponseWriter, pr *proxyRequest, err error) {
+	pr.stats.InferenceTimedOut = isInferenceTimeout(err)
+	pr.stats.InferenceNoRouting = true
 	pr.requestLogger.Error("Failed to get endpoints", "error", err)
 	http.Error(w, fmt.Sprintf("Service unavailable: %v", err), http.StatusBadGateway)
 }

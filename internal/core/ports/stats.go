@@ -34,6 +34,67 @@ type StatsCollector interface {
 	GetConnectionCount(endpoint string) int64
 }
 
+// InferenceHealthCollector is an optional request-oriented health seam. It is
+// separate from StatsCollector so existing collectors and test doubles retain
+// their attempt-oriented contract.
+type InferenceHealthCollector interface {
+	RecordInferenceRequest(InferenceRequestOutcome)
+	GetInferenceHealth(knownModels map[string]bool, now time.Time) InferenceHealth
+}
+
+// InferenceRequestOutcome describes the final result seen by a client. Each
+// logical request contributes at most one outcome, regardless of proxy retries.
+type InferenceRequestOutcome struct {
+	At          time.Time
+	Model       string
+	Latency     time.Duration
+	StatusCode  int
+	ModelKnown  bool
+	TimedOut    bool
+	NoRouting   bool
+	StreamError bool
+}
+
+type InferenceHealth struct {
+	Models           map[string]InferenceModelHealth `json:"models"`
+	Status           string                          `json:"status"`
+	State            string                          `json:"state"`
+	Availability     InferenceModelAvailability      `json:"availability"`
+	Observations     int                             `json:"observations"`
+	Successes        int                             `json:"successes"`
+	ServerErrors     int                             `json:"server_errors"`
+	StreamErrors     int                             `json:"stream_errors"`
+	Timeouts         int                             `json:"timeouts"`
+	NoRouting        int                             `json:"no_routing"`
+	Upstream429      int                             `json:"upstream_429"`
+	FailureRate      float64                         `json:"failure_rate"`
+	AverageLatencyMs int64                           `json:"average_latency_ms"`
+	ModelsTruncated  bool                            `json:"models_truncated"`
+}
+
+type InferenceModelAvailability struct {
+	Status      string `json:"status"`
+	Known       int    `json:"known"`
+	Available   int    `json:"available"`
+	Unavailable int    `json:"unavailable"`
+}
+
+type InferenceModelHealth struct {
+	Status           string  `json:"status"`
+	State            string  `json:"state"`
+	RequestStatus    string  `json:"request_status"`
+	Availability     string  `json:"availability"`
+	Observations     int     `json:"observations"`
+	Successes        int     `json:"successes"`
+	ServerErrors     int     `json:"server_errors"`
+	StreamErrors     int     `json:"stream_errors"`
+	Timeouts         int     `json:"timeouts"`
+	NoRouting        int     `json:"no_routing"`
+	Upstream429      int     `json:"upstream_429"`
+	FailureRate      float64 `json:"failure_rate"`
+	AverageLatencyMs int64   `json:"average_latency_ms"`
+}
+
 type EndpointStats struct {
 	Name               string  `json:"name"`
 	URL                string  `json:"url"`

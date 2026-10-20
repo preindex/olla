@@ -160,6 +160,7 @@ nav:
       - Endpoint Auth: configuration/endpoint-auth.md
       - Remote Backends (Experimental): configuration/endpoint-auth-remote.md
       - Filters: configuration/filters.md
+      - Docker Swarm Discovery: configuration/swarm-discovery.md
       - Reference: configuration/reference.md
       - Examples: configuration/examples.md
       - Best Practices:

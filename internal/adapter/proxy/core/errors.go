@@ -1,6 +1,10 @@
 package core
 
-import "errors"
+import (
+	"context"
+	"errors"
+	"net"
+)
 
 // ErrCircuitBreakerOpen signals that a per-endpoint circuit breaker rejected
 // the attempt before any network I/O. ExecuteWithRetry treats it as
@@ -9,3 +13,13 @@ import "errors"
 // rejection reflects the breaker's accumulated state, not a fresh connectivity
 // failure, so demoting here would double-count and corrupt health tracking.
 var ErrCircuitBreakerOpen = errors.New("circuit breaker open")
+
+// IsTimeoutError preserves timeout classification independently of user-facing
+// error formatting, which may intentionally discard the original error chain.
+func IsTimeoutError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
