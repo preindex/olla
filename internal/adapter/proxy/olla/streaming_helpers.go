@@ -76,7 +76,7 @@ func (s *Service) checkContexts(clientCtx, upstreamCtx context.Context, readDead
 	case <-upstreamCtx.Done():
 		return upstreamCtx.Err()
 	case <-readDeadline.C:
-		return fmt.Errorf("read timeout after %v", readTimeout)
+		return &core.StreamTimeoutError{Message: fmt.Sprintf("read timeout after %v", readTimeout)}
 	default:
 		return nil
 	}

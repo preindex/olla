@@ -48,6 +48,8 @@ engineering:    # Debug features
 
 `/internal/status` includes an additive `inference` object with recent request outcomes for the whole proxy and for each known or recently used model. This view counts one final outcome per client request, so retries do not inflate the sample. It does not change `/internal/health`, which remains a liveness check.
 
+The legacy `system.status` remains based on endpoint health and lifetime aggregate request statistics. `inference.status` uses rolling final request outcomes and current model availability; the two statuses can differ. Proxied management reads such as model listings and version checks do not contribute inference observations.
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `inference_health.enabled` | bool | `true` | Include the inference health object in `/internal/status` |

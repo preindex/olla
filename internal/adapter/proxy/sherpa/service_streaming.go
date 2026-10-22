@@ -146,7 +146,7 @@ func (s *Service) performTimedRead(combinedCtx context.Context, body io.Reader, 
 			"total_bytes", state.totalBytes,
 			"read_count", state.readCount,
 			"time_since_last_read", time.Since(state.lastReadTime))
-		return nil, fmt.Errorf("AI backend stopped responding - no data received for %.1fs (backend may be overloaded)", readTimeout.Seconds())
+		return nil, &core.StreamTimeoutError{Message: fmt.Sprintf("AI backend stopped responding - no data received for %.1fs (backend may be overloaded)", readTimeout.Seconds())}
 
 	case result := <-readCh:
 		state.readCount++

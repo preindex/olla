@@ -164,7 +164,10 @@ func (u *blockingModelUnifier) UnifyModel(ctx context.Context, model *domain.Mod
 
 func (u *blockingModelUnifier) UnifyModels(_ context.Context, models []*domain.ModelInfo, endpoint *domain.Endpoint) ([]*domain.UnifiedModel, error) {
 	if len(models) == 0 {
-		u.cleanup <- struct{}{}
+		select {
+		case u.cleanup <- struct{}{}:
+		default:
+		}
 		return nil, nil
 	}
 	close(u.started)

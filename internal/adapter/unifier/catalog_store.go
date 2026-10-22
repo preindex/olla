@@ -343,6 +343,15 @@ func (c *CatalogStore) deepCopyForModification(model *domain.UnifiedModel) *doma
 		for k, v := range model.Metadata {
 			modelCopy.Metadata[k] = v
 		}
+		// mergeMetadata adds platforms in place, so this nested map must also
+		// belong to the copy rather than the published catalogue snapshot.
+		if platforms, ok := model.Metadata["platforms"].(map[string]bool); ok && platforms != nil {
+			platformsCopy := make(map[string]bool, len(platforms))
+			for platform, present := range platforms {
+				platformsCopy[platform] = present
+			}
+			modelCopy.Metadata["platforms"] = platformsCopy
+		}
 	}
 
 	return modelCopy

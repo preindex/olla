@@ -626,6 +626,13 @@ func hashStatusResponse(resp *StatusResponse) string {
 	for i := range resp.Endpoints {
 		hashEndpointResponse(h, &resp.Endpoints[i])
 	}
+	// Inference health contains only semantic state and measurements, with no
+	// polling timestamps. JSON sorts model keys so map iteration cannot churn
+	// the validator. The response has already been marshalled successfully.
+	if resp.Inference != nil {
+		inference, _ := json.Marshal(resp.Inference)
+		hashEtagString(h, string(inference))
+	}
 	return formatEtag(h)
 }
 

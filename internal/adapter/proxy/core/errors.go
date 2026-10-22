@@ -14,10 +14,22 @@ import (
 // failure, so demoting here would double-count and corrupt health tracking.
 var ErrCircuitBreakerOpen = errors.New("circuit breaker open")
 
+// StreamTimeoutError retains the existing stream error text and proxy behaviour
+// while allowing request health to distinguish a stalled read from interruption.
+type StreamTimeoutError struct {
+	Message string
+}
+
+func (e *StreamTimeoutError) Error() string { return e.Message }
+
 // IsTimeoutError preserves timeout classification independently of user-facing
 // error formatting, which may intentionally discard the original error chain.
 func IsTimeoutError(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var streamTimeout *StreamTimeoutError
+	if errors.As(err, &streamTimeout) {
 		return true
 	}
 	var netErr net.Error

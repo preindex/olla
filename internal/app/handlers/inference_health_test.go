@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/thushan/olla/internal/adapter/inspector"
+	"github.com/thushan/olla/internal/adapter/translator"
 	"github.com/thushan/olla/internal/config"
 	"github.com/thushan/olla/internal/core/constants"
 	"github.com/thushan/olla/internal/core/domain"
@@ -59,6 +62,178 @@ func TestStatusHandlerIncludesInferenceHealthAdditively(t *testing.T) {
 	require.Equal(t, "critical", inference.Models["chat"].Status)
 }
 
+func TestStatusInferenceETagTracksSemanticChanges(t *testing.T) {
+	stats := &inferenceStatusStats{
+		mockStatusStatsCollector: &mockStatusStatsCollector{},
+		health: ports.InferenceHealth{
+			Status: "insufficient_data", State: "insufficient_data",
+			Availability: ports.InferenceModelAvailability{Status: "partial", Known: 2, Available: 1, Unavailable: 1},
+			Models: map[string]ports.InferenceModelHealth{
+				"chat": {Status: "insufficient_data", State: "insufficient_data", Availability: "available"},
+				"code": {Status: "unavailable", State: "unavailable", Availability: "unavailable"},
+			},
+		},
+	}
+	app := buildSystemStatusApp(t, allHealthyEndpoints(), ports.ProxyStats{})
+	app.statsCollector = stats
+	app.Config.InferenceHealth = config.DefaultInferenceHealthConfig()
+	poll := func(etag string, wantStatus int) string {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet, "/internal/status", nil)
+		request.Header.Set("If-None-Match", etag)
+		response := httptest.NewRecorder()
+		app.statusHandler(response, request)
+		require.Equal(t, wantStatus, response.Code)
+		return response.Header().Get("ETag")
+	}
+	etag := poll("", http.StatusOK)
+	require.Equal(t, etag, poll(etag, http.StatusNotModified))
+
+	// Window expiry changes inference state without changing legacy counters.
+	stats.health.Status, stats.health.State = "idle", "idle"
+	next := poll(etag, http.StatusOK)
+	require.NotEqual(t, etag, next)
+	etag = next
+
+	// Swap model availability while keeping aggregate availability unchanged.
+	stats.health.Models["chat"], stats.health.Models["code"] = stats.health.Models["code"], stats.health.Models["chat"]
+	next = poll(etag, http.StatusOK)
+	require.NotEqual(t, etag, next)
+	etag = next
+
+	stats.health.Observations, stats.health.ServerErrors = 1, 1
+	next = poll(etag, http.StatusOK)
+	require.NotEqual(t, etag, next)
+	require.Equal(t, next, poll(next, http.StatusNotModified))
+
+	first := hashStatusResponse(&StatusResponse{Inference: &stats.health})
+	stats.health.Models = map[string]ports.InferenceModelHealth{
+		"code": stats.health.Models["code"], "chat": stats.health.Models["chat"],
+	}
+	require.Equal(t, first, hashStatusResponse(&StatusResponse{Inference: &stats.health}))
+	app.Config.InferenceHealth.Enabled = false
+	poll(next, http.StatusOK)
+}
+
+func TestInferenceOutcomeDoesNotInventSuccessOnEarlyReturn(t *testing.T) {
+	stats := &inferenceCaptureStats{mockStatsCollector: &mockStatsCollector{}}
+	app := &Application{statsCollector: stats}
+	app.recordInferenceOutcome(context.Background(), &proxyRequest{
+		method: http.MethodPost, model: "chat", stats: &ports.RequestStats{StartTime: time.Now()},
+	}, newInferenceOutcomeWriter(httptest.NewRecorder()))
+	require.Empty(t, stats.outcomes)
+}
+
+type inferenceFlushErrorWriter struct {
+	*httptest.ResponseRecorder
+}
+
+func (*inferenceFlushErrorWriter) FlushError() error { return errors.New("client disconnected") }
+
+func TestInferenceOutcomeExcludesClientFlushFailure(t *testing.T) {
+	stats := &inferenceCaptureStats{mockStatsCollector: &mockStatsCollector{}}
+	app := &Application{statsCollector: stats}
+	writer := newInferenceOutcomeWriter(&inferenceFlushErrorWriter{httptest.NewRecorder()})
+	require.Error(t, http.NewResponseController(writer).Flush())
+	app.recordInferenceOutcome(context.Background(), &proxyRequest{
+		method: http.MethodPost, model: "chat", stats: &ports.RequestStats{StartTime: time.Now()},
+	}, writer)
+	require.Empty(t, stats.outcomes)
+}
+
+type inferenceHeaderWriter struct {
+	*httptest.ResponseRecorder
+	statuses []int
+}
+
+func (w *inferenceHeaderWriter) WriteHeader(status int) {
+	w.statuses = append(w.statuses, status)
+}
+
+func TestInferenceOutcomeWriterPassesInformationalHeaders(t *testing.T) {
+	underlying := &inferenceHeaderWriter{ResponseRecorder: httptest.NewRecorder()}
+	writer := newInferenceOutcomeWriter(underlying)
+	writer.WriteHeader(http.StatusEarlyHints)
+	require.Zero(t, writer.status)
+	writer.WriteHeader(http.StatusServiceUnavailable)
+	require.Equal(t, http.StatusServiceUnavailable, writer.status)
+	require.Equal(t, []int{http.StatusEarlyHints, http.StatusServiceUnavailable}, underlying.statuses)
+}
+
+func TestTranslationUncommittedErrorWithContentTypeRecordsFailure(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprintf("streaming=%t", streaming), func(t *testing.T) {
+			stats := &inferenceCaptureStats{mockStatsCollector: &mockStatsCollector{}}
+			log := &mockStyledLogger{}
+			trans := &mockTranslator{
+				name: "test-translator", implementsErrorWriter: true,
+				writeErrorFunc: func(w http.ResponseWriter, _ error, status int) { w.WriteHeader(status) },
+				transformRequestFunc: func(context.Context, *http.Request) (*translator.TransformedRequest, error) {
+					return &translator.TransformedRequest{OpenAIRequest: map[string]interface{}{"model": "chat"}, IsStreaming: streaming}, nil
+				},
+				transformResponseFunc: func(context.Context, interface{}, *http.Request) (interface{}, error) {
+					return map[string]interface{}{"unsupported": make(chan int)}, nil
+				},
+				transformStreamingFunc: func(_ context.Context, upstream io.Reader, w http.ResponseWriter, _ *http.Request) error {
+					_, err := io.Copy(io.Discard, upstream)
+					if err != nil {
+						return err
+					}
+					w.Header().Set(constants.HeaderContentType, "text/event-stream")
+					return errors.New("translation failed before writing")
+				},
+			}
+			app := &Application{
+				logger: log, statsCollector: stats, Config: &config.Config{},
+				repository: &mockEndpointRepository{}, inspectorChain: inspector.NewChain(log),
+				profileFactory: &mockProfileFactory{}, discoveryService: &mockDiscoveryServiceForTranslation{},
+				proxyService: &mockProxyService{proxyFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request, _ []*domain.Endpoint, _ *ports.RequestStats, _ logger.StyledLogger) error {
+					_, err := w.Write([]byte(`{"id":"ok"}`))
+					return err
+				}},
+			}
+			request := httptest.NewRequest(http.MethodPost, "/olla/anthropic/v1/messages", strings.NewReader(`{"model":"chat"}`))
+			response := httptest.NewRecorder()
+			app.translationHandler(trans).ServeHTTP(response, request)
+			require.Equal(t, http.StatusBadGateway, response.Code)
+			require.Len(t, stats.outcomes, 1)
+			require.Equal(t, http.StatusBadGateway, stats.outcomes[0].StatusCode)
+		})
+	}
+}
+
+func TestInferenceCancelledTranslationWaitsForProxyStats(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	returned := make(chan error, 1)
+	log := &mockStyledLogger{}
+	pr := &proxyRequest{model: "chat", requestLogger: log, stats: &ports.RequestStats{StartTime: time.Now()}}
+	app := &Application{proxyService: &mockProxyService{proxyFunc: func(ctx context.Context, _ http.ResponseWriter, _ *http.Request, _ []*domain.Endpoint, stats *ports.RequestStats, _ logger.StyledLogger) error {
+		close(started)
+		<-ctx.Done()
+		<-finish
+		stats.InferenceStreamError = true
+		return ctx.Err()
+	}}}
+	go func() {
+		returned <- app.executeTranslatedStreamingRequest(ctx, httptest.NewRecorder(),
+			httptest.NewRequest(http.MethodPost, "/test", nil), []*domain.Endpoint{{Name: "ep"}}, pr, &mockTranslator{})
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-returned:
+		close(finish)
+		t.Fatalf("returned before proxy completed its stats updates: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(finish)
+	require.ErrorIs(t, <-returned, context.Canceled)
+	require.True(t, pr.stats.InferenceStreamError)
+}
+
 func TestInferenceOutcomeWriterPreservesStreamingFlush(t *testing.T) {
 	underlying := httptest.NewRecorder()
 	writer := newInferenceOutcomeWriter(underlying)
@@ -90,7 +265,7 @@ func TestInferenceOutcomeWriterExcludesClientWriteFailure(t *testing.T) {
 	_, err := writer.Write([]byte("response"))
 	require.Error(t, err)
 	app.recordInferenceOutcome(context.Background(), &proxyRequest{
-		model: "chat", stats: &ports.RequestStats{StartTime: time.Now()},
+		method: http.MethodPost, model: "chat", stats: &ports.RequestStats{StartTime: time.Now()},
 	}, writer)
 	stats.mu.Lock()
 	defer stats.mu.Unlock()
@@ -123,6 +298,8 @@ func (s *inferenceCaptureStats) GetInferenceHealth(map[string]bool, time.Time) p
 func TestProxyHandlerRecordsOneFinalInferenceOutcome(t *testing.T) {
 	tests := []struct {
 		name        string
+		method      string
+		path        string
 		status      int
 		attempts    int
 		streamError bool
@@ -135,6 +312,9 @@ func TestProxyHandlerRecordsOneFinalInferenceOutcome(t *testing.T) {
 		{name: "client 4xx excluded by collector", status: http.StatusBadRequest, attempts: 1, wantCount: 1, wantClass: "client_4xx"},
 		{name: "stream error after 200", status: http.StatusOK, attempts: 1, streamError: true, wantCount: 1, wantClass: "stream_errors"},
 		{name: "cancelled request excluded", status: http.StatusOK, attempts: 1, cancel: true},
+		{name: "model listing excluded", method: http.MethodGet, path: "/olla/proxy/v1/models", status: http.StatusOK, attempts: 1},
+		{name: "version check excluded", method: http.MethodGet, path: "/olla/proxy/api/version", status: http.StatusOK, attempts: 1},
+		{name: "process listing excluded", method: http.MethodGet, path: "/olla/proxy/api/ps", status: http.StatusOK, attempts: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -163,7 +343,18 @@ func TestProxyHandlerRecordsOneFinalInferenceOutcome(t *testing.T) {
 				t.Fatal("capture collector does not satisfy optional inference-health seam")
 			}
 
-			request := httptest.NewRequest(http.MethodPost, "/olla/proxy/v1/chat/completions", strings.NewReader(`{"model":"chat"}`))
+			method, path := tt.method, tt.path
+			if method == "" {
+				method = http.MethodPost
+			}
+			if path == "" {
+				path = "/olla/proxy/v1/chat/completions"
+			}
+			var body io.Reader
+			if method == http.MethodPost {
+				body = strings.NewReader(`{"model":"chat"}`)
+			}
+			request := httptest.NewRequest(method, path, body)
 			request.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
 			request = request.WithContext(context.WithValue(request.Context(), constants.ContextRoutePrefixKey, "/olla/proxy/"))
 			if tt.cancel {

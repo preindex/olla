@@ -166,6 +166,66 @@ func TestRetryOnConnectionFailure(t *testing.T) {
 	assert.Contains(t, discoveryService.updateStatusCalls, "failing")
 }
 
+func TestInferenceStreamReadTimeoutIsRecorded(t *testing.T) {
+	log := createRetryTestLogger()
+	cfg := &Configuration{}
+	cfg.ReadTimeout = 10 * time.Millisecond
+	cfg.StreamBufferSize = 8192
+	service, err := NewService(nil, &testSelector{}, cfg, nil, nil, log)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	t.Cleanup(service.Cleanup)
+	stalled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("data: prefix\n\n"))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer stalled.Close()
+	target, _ := url.Parse(stalled.URL)
+	stats := &ports.RequestStats{StartTime: time.Now()}
+	err = service.proxyToSingleEndpoint(context.Background(), httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodPost, "/test", nil),
+		&domain.Endpoint{Name: "stalled", URL: target, URLString: stalled.URL, Status: domain.StatusHealthy}, stats, log)
+	if err == nil || !strings.Contains(err.Error(), "AI backend stopped responding") {
+		t.Fatalf("stream timeout message changed: %v", err)
+	}
+	if !stats.InferenceTimedOut || !stats.InferenceStreamError {
+		t.Fatalf("stalled stream was not recorded as a timeout: %+v", stats)
+	}
+}
+
+func TestInferenceEngineInterruptedStream(t *testing.T) {
+	log := createRetryTestLogger()
+	cfg := &Configuration{}
+	cfg.StreamBufferSize = 8192
+	service, err := NewService(nil, &testSelector{}, cfg, nil, nil, log)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	t.Cleanup(service.Cleanup)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Length", "1000")
+		_, _ = w.Write([]byte("data: prefix\n\n"))
+		w.(http.Flusher).Flush()
+	}))
+	defer backend.Close()
+	target, _ := url.Parse(backend.URL)
+	stats := &ports.RequestStats{StartTime: time.Now()}
+	response := httptest.NewRecorder()
+	err = service.proxyToSingleEndpoint(context.Background(), response,
+		httptest.NewRequest(http.MethodPost, "/test", nil),
+		&domain.Endpoint{Name: "backend", URL: target, URLString: backend.URL, Status: domain.StatusHealthy}, stats, log)
+	if err == nil || response.Code != http.StatusOK || response.Body.Len() == 0 {
+		t.Fatalf("expected failure after a partial 200 response: status=%d body=%q err=%v", response.Code, response.Body.String(), err)
+	}
+	if !stats.InferenceStreamError || stats.InferenceTimedOut {
+		t.Fatalf("incorrect interrupted stream outcome flags: %+v", stats)
+	}
+}
+
 func TestInferenceTimeoutSurvivesFriendlyErrorAndSuccessfulNextAttemptClearsIt(t *testing.T) {
 	mockLogger := createRetryTestLogger()
 	config := &Configuration{}
