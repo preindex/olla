@@ -217,7 +217,8 @@ func (u *DefaultUnifier) mergeModel(unified *domain.UnifiedModel, model *Model, 
 		return
 	}
 
-	// Safe to modify - store returns deep copies
+	// Catalogue reads are shared snapshots; copy before changing model data.
+	unified = u.store.deepCopyForModification(unified)
 
 	endpointURL := endpoint.GetURLString()
 
@@ -350,7 +351,8 @@ func (u *DefaultUnifier) removeModelFromEndpoint(modelID, endpointURL string) {
 		return
 	}
 
-	// GetModel returns a deep copy
+	// Catalogue reads are shared snapshots.
+	model = u.store.deepCopyForModification(model)
 	newSources := make([]domain.SourceEndpoint, 0, len(model.SourceEndpoints))
 	for _, source := range model.SourceEndpoints {
 		if source.EndpointURL != endpointURL {

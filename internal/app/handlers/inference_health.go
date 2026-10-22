@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
@@ -24,6 +25,10 @@ func (w *inferenceOutcomeWriter) WriteHeader(status int) {
 	if w.status != 0 {
 		return
 	}
+	if status >= 100 && status < 200 {
+		w.ResponseWriter.WriteHeader(status)
+		return
+	}
 	w.status = status
 	w.ResponseWriter.WriteHeader(status)
 }
@@ -42,12 +47,20 @@ func (w *inferenceOutcomeWriter) Write(p []byte) (int, error) {
 func (w *inferenceOutcomeWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (w *inferenceOutcomeWriter) Flush() {
-	if w.status == 0 {
-		w.status = http.StatusOK
+	_ = w.FlushError()
+}
+
+func (w *inferenceOutcomeWriter) FlushError() error {
+	err := http.NewResponseController(w.ResponseWriter).Flush()
+	if !errors.Is(err, http.ErrNotSupported) {
+		if w.status == 0 {
+			w.status = http.StatusOK
+		}
+		if err != nil {
+			w.writeFailed = true
+		}
 	}
-	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
-		flusher.Flush()
-	}
+	return err
 }
 
 func (a *Application) recordInferenceOutcome(ctx context.Context, pr *proxyRequest, w *inferenceOutcomeWriter) {
@@ -55,14 +68,23 @@ func (a *Application) recordInferenceOutcome(ctx context.Context, pr *proxyReque
 	if !ok || pr == nil || pr.stats == nil || (w != nil && w.writeFailed) {
 		return
 	}
+	// Supported inference APIs use POST. Proxied model listings, version checks
+	// and other management reads must not turn idle inference into healthy traffic.
+	if pr.method != http.MethodPost {
+		return
+	}
 	if ctx != nil && ctx.Err() == context.Canceled {
 		return
 	}
-	status := http.StatusOK
+	// An early return without a committed response is not evidence of success.
+	status := 0
 	if w != nil {
 		if w.status != 0 {
 			status = w.status
 		}
+	}
+	if status == 0 && !pr.stats.InferenceTimedOut && !pr.stats.InferenceNoRouting && !pr.stats.InferenceStreamError {
+		return
 	}
 	modelKnown := a.inferenceModelKnown(ctx, pr.model)
 	if status >= http.StatusOK && status < http.StatusMultipleChoices && a.Config != nil && a.Config.Discovery.ModelDiscovery.Enabled {

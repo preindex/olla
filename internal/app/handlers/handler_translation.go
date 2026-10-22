@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	proxycore "github.com/thushan/olla/internal/adapter/proxy/core"
 	"github.com/thushan/olla/internal/adapter/translator"
 	"github.com/thushan/olla/internal/core/constants"
 	"github.com/thushan/olla/internal/core/domain"
@@ -32,6 +33,8 @@ func (a *Application) executePassthroughRequest(
 	pr *proxyRequest,
 	trans translator.RequestTranslator,
 ) {
+	tracker := proxycore.NewResponseStartedWriter(w)
+	w = tracker
 	// Get passthrough request details
 	passthroughTrans, ok := trans.(translator.PassthroughCapable)
 	if !ok {
@@ -98,7 +101,7 @@ func (a *Application) executePassthroughRequest(
 
 	if err != nil {
 		// only write error if response hasn't started
-		if w.Header().Get(constants.HeaderContentType) == "" {
+		if !tracker.Started() {
 			a.writeTranslatorError(w, trans, pr, fmt.Errorf("proxy error: %w", err), http.StatusBadGateway)
 		}
 	}
@@ -190,6 +193,8 @@ func (a *Application) executeTranslationRequest(
 	trans translator.RequestTranslator,
 	transformedReq *translator.TransformedRequest,
 ) {
+	tracker := proxycore.NewResponseStartedWriter(w)
+	w = tracker
 	// Capture streaming flag for metrics before proxying
 	pr.isStreaming = transformedReq.IsStreaming
 
@@ -263,7 +268,7 @@ func (a *Application) executeTranslationRequest(
 			pr.stats.InferenceStreamError = true
 		}
 		// only write error if response hasn't started
-		if w.Header().Get(constants.HeaderContentType) == "" {
+		if !tracker.Started() {
 			a.writeTranslatorError(w, trans, pr, fmt.Errorf("proxy error: %w", proxyErr), http.StatusBadGateway)
 		}
 	}
@@ -697,6 +702,7 @@ func (a *Application) executeTranslatedStreamingRequest(
 	case <-streamRecorder.headersReady:
 	case <-ctx.Done():
 		pipeReader.CloseWithError(ctx.Err()) // unblock any proxy goroutine stuck mid-write to pipeWriter
+		<-proxyErrChan                       // finish stats updates before recording the final outcome
 		return fmt.Errorf("request cancelled while waiting for backend headers: %w", ctx.Err())
 	}
 
@@ -783,15 +789,15 @@ func (a *Application) handleStreamingPanic(
 	trans translator.RequestTranslator,
 ) {
 	if r := recover(); r != nil {
-		if pr != nil && pr.stats != nil {
-			pr.stats.InferenceStreamError = true
-		}
 		// Close both ends of the pipe to unblock the proxy goroutine.
 		pipeReader.Close()
 		pipeWriter.Close()
 
 		// Drain the buffered error channel to release the proxy goroutine.
 		<-proxyErrChan
+		if pr != nil && pr.stats != nil {
+			pr.stats.InferenceStreamError = true
+		}
 
 		a.logger.Error("Panic during stream transformation",
 			"panic", r,

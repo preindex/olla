@@ -162,6 +162,15 @@ func (r *UnifiedMemoryModelRegistry) unifyModelsAsync(ctx context.Context, endpo
 	r.unificationMutex.Lock()
 	defer r.unificationMutex.Unlock()
 
+	// UnifyModels mutates its own catalogue, so reject stale callbacks before
+	// invoking it as well as before publishing to globalUnified.
+	r.generationMu.Lock()
+	current := r.unificationTokens[endpointURL] == token
+	r.generationMu.Unlock()
+	if !current {
+		return
+	}
+
 	// Get or create endpoint object
 	endpoint, exists := r.endpoints.Load(endpointURL)
 	if !exists {
@@ -174,6 +183,17 @@ func (r *UnifiedMemoryModelRegistry) unifyModelsAsync(ctx context.Context, endpo
 
 	// Unify all models for this endpoint
 	unifiedModels, err := r.unifier.UnifyModels(ctx, models, endpoint)
+	r.generationMu.Lock()
+	if r.unificationTokens[endpointURL] != token {
+		r.generationMu.Unlock()
+		// The unification lock prevents a newer worker from entering the unifier.
+		// Undo this callback's changes even if its context was cancelled.
+		if _, cleanupErr := r.unifier.UnifyModels(context.WithoutCancel(ctx), nil, endpoint); cleanupErr != nil {
+			r.logger.ErrorWithEndpoint(endpoint.Name, "Failed to clear stale unification", cleanupErr)
+		}
+		return
+	}
+	defer r.generationMu.Unlock()
 	if err != nil {
 		r.logger.ErrorWithEndpoint(endpoint.Name, "Failed to unify models", err)
 		return
@@ -190,8 +210,14 @@ func (r *UnifiedMemoryModelRegistry) unifyModelsAsync(ctx context.Context, endpo
 		// Check if we already have this model globally
 		existing, exists := r.globalUnified.Load(id)
 		if exists {
-			// Merge with existing
-			group = append(group, existing)
+			// Keep the published model available until its replacement is ready.
+			// Exclude this endpoint's old source from the merge without mutating it.
+			existingCopy := *existing
+			existingCopy.SourceEndpoints = append([]domain.SourceEndpoint(nil), existing.SourceEndpoints...)
+			existingCopy.RemoveEndpoint(endpointURL)
+			if existingCopy.IsAvailable() {
+				group = append(group, &existingCopy)
+			}
 		}
 
 		merged, err := r.unifier.MergeUnifiedModels(ctx, group)
@@ -200,33 +226,46 @@ func (r *UnifiedMemoryModelRegistry) unifyModelsAsync(ctx context.Context, endpo
 			continue
 		}
 
-		r.generationMu.Lock()
-		if r.unificationTokens[endpointURL] != token {
-			r.generationMu.Unlock()
-			return
-		}
 		r.globalUnified.Store(id, merged)
-
-		// update cached endpoint set for this model
-		var endpointURLs []string
-		for _, sourceEndpoint := range merged.SourceEndpoints {
-			endpointURLs = append(endpointURLs, sourceEndpoint.EndpointURL)
-		}
-
-		// we cache under the unified ID
-		r.updateEndpointSet(id, endpointURLs)
-
-		// and also cache under all native names and aliases for fast lookup
-		for _, sourceEndpoint := range merged.SourceEndpoints {
-			r.updateEndpointSet(sourceEndpoint.NativeName, endpointURLs)
-		}
-		for _, alias := range merged.Aliases {
-			r.updateEndpointSet(alias.Name, endpointURLs)
-		}
-		r.generationMu.Unlock()
+		r.updateUnifiedEndpointSets(id, merged, existing)
 	}
 
+	// Retained IDs were replaced directly; only omitted IDs need removal.
+	r.removeUnifiedEndpoint(endpointURL, modelGroups)
+
 	// r.logger.InfoWithEndpoint(" ", endpointUrl, "models", len(unifiedModels))
+}
+
+// updateUnifiedEndpointSets refreshes caches after replacement publication.
+// The caller holds unificationMutex to serialise publication and invalidation.
+func (r *UnifiedMemoryModelRegistry) updateUnifiedEndpointSets(id string, merged, existing *domain.UnifiedModel) {
+	var endpointURLs []string
+	for _, sourceEndpoint := range merged.SourceEndpoints {
+		endpointURLs = append(endpointURLs, sourceEndpoint.EndpointURL)
+	}
+
+	r.updateEndpointSet(id, endpointURLs)
+	cachedNames := map[string]bool{id: true}
+	for _, sourceEndpoint := range merged.SourceEndpoints {
+		r.updateEndpointSet(sourceEndpoint.NativeName, endpointURLs)
+		cachedNames[sourceEndpoint.NativeName] = true
+	}
+	for _, alias := range merged.Aliases {
+		r.updateEndpointSet(alias.Name, endpointURLs)
+		cachedNames[alias.Name] = true
+	}
+	if existing != nil {
+		for _, sourceEndpoint := range existing.SourceEndpoints {
+			if !cachedNames[sourceEndpoint.NativeName] {
+				r.modelEndpointSets.Delete(sourceEndpoint.NativeName)
+			}
+		}
+		for _, alias := range existing.Aliases {
+			if !cachedNames[alias.Name] {
+				r.modelEndpointSets.Delete(alias.Name)
+			}
+		}
+	}
 }
 
 // updateEndpointSet updates the cached endpoint set for a given model
@@ -376,8 +415,20 @@ func (r *UnifiedMemoryModelRegistry) RemoveEndpoint(ctx context.Context, endpoin
 	}
 	_, unifierErr := r.unifier.UnifyModels(ctx, nil, endpoint)
 
-	// Remove endpoint from all unified models
+	r.removeUnifiedEndpoint(endpointURL, nil)
+	return unifierErr
+}
+
+// removeUnifiedEndpoint skips retained IDs and requires unificationMutex. Readers
+// may still hold the published model, so remove endpoints from a copy.
+func (r *UnifiedMemoryModelRegistry) removeUnifiedEndpoint(endpointURL string, retained map[string][]*domain.UnifiedModel) {
 	r.globalUnified.Range(func(id string, model *domain.UnifiedModel) bool {
+		if _, exists := retained[id]; exists {
+			return true
+		}
+		modelCopy := *model
+		modelCopy.SourceEndpoints = append([]domain.SourceEndpoint(nil), model.SourceEndpoints...)
+		model = &modelCopy
 		// we're capturing model metadata BEFORE mutation to avoid accessing empty slices
 		// when the last endpoint is removed (model.RemoveEndpoint empties SourceEndpoints)
 		sourceEndpoints := make([]domain.SourceEndpoint, len(model.SourceEndpoints))
@@ -386,14 +437,15 @@ func (r *UnifiedMemoryModelRegistry) RemoveEndpoint(ctx context.Context, endpoin
 		copy(aliases, model.Aliases)
 
 		if model.RemoveEndpoint(endpointURL) {
+			// A removed native name may not be an alias of the surviving model.
+			for _, sourceEndpoint := range sourceEndpoints {
+				r.modelEndpointSets.Delete(sourceEndpoint.NativeName)
+			}
 			// If no endpoints left, remove the unified model and its cached sets
 			if !model.IsAvailable() {
 				r.globalUnified.Delete(id)
 				// delete cache entries for all model names using captured snapshots
 				r.modelEndpointSets.Delete(id)
-				for _, sourceEndpoint := range sourceEndpoints {
-					r.modelEndpointSets.Delete(sourceEndpoint.NativeName)
-				}
 				for _, alias := range aliases {
 					r.modelEndpointSets.Delete(alias.Name)
 				}
@@ -401,6 +453,7 @@ func (r *UnifiedMemoryModelRegistry) RemoveEndpoint(ctx context.Context, endpoin
 				// Update the model
 				model.DiskSize = model.GetTotalDiskSize()
 				model.LastSeen = time.Now()
+				r.globalUnified.Store(id, model)
 
 				// update cached endpoint set to reflect the removed endpoint
 				var endpointURLs []string
@@ -421,7 +474,6 @@ func (r *UnifiedMemoryModelRegistry) RemoveEndpoint(ctx context.Context, endpoin
 		return true
 	})
 
-	return unifierErr
 }
 
 // GetHealthyEndpointsForModel returns healthy endpoints that have a specific model

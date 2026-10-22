@@ -2,6 +2,7 @@ package olla
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -19,6 +20,58 @@ import (
 // funcName extracts the full symbol name of a function value.
 func funcName(f interface{}) string {
 	return runtime.FuncForPC(reflect.ValueOf(f).Pointer()).Name()
+}
+
+func TestInferenceStreamReadTimeoutClassificationPreservesMessage(t *testing.T) {
+	expired := make(chan time.Time, 1)
+	expired <- time.Now()
+	service := &Service{}
+	err := service.checkContexts(context.Background(), context.Background(), &time.Timer{C: expired}, time.Second, &streamState{}, createTestLogger())
+	if err == nil || err.Error() != "read timeout after 1s" || !core.IsTimeoutError(err) {
+		t.Fatalf("stream timeout classification or message changed: %v", err)
+	}
+}
+
+func TestInferenceEngineStreamFailure(t *testing.T) {
+	for _, timedOut := range []bool{false, true} {
+		t.Run(fmt.Sprintf("timeout=%t", timedOut), func(t *testing.T) {
+			cfg := &Configuration{}
+			cfg.StreamBufferSize = 8192
+			service, err := NewService(nil, nil, cfg, nil, nil, createTestLogger())
+			if err != nil {
+				t.Fatalf("NewService: %v", err)
+			}
+			t.Cleanup(service.Cleanup)
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set("Content-Length", "1000")
+				_, _ = w.Write([]byte("data: prefix\n\n"))
+				w.(http.Flusher).Flush()
+				if timedOut {
+					<-r.Context().Done()
+				}
+			}))
+			defer backend.Close()
+			target, _ := url.Parse(backend.URL)
+			ctx := context.Background()
+			if timedOut {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, 100*time.Millisecond)
+				defer cancel()
+			}
+			stats := &ports.RequestStats{StartTime: time.Now()}
+			response := httptest.NewRecorder()
+			err = service.proxyToSingleEndpoint(ctx, response,
+				httptest.NewRequest(http.MethodPost, "/test", nil),
+				&domain.Endpoint{Name: "backend", URL: target, URLString: backend.URL, Status: domain.StatusHealthy}, stats, createTestLogger())
+			if err == nil || response.Code != http.StatusOK || response.Body.Len() == 0 {
+				t.Fatalf("expected failure after a partial 200 response: status=%d body=%q err=%v", response.Code, response.Body.String(), err)
+			}
+			if !stats.InferenceStreamError || stats.InferenceTimedOut != timedOut {
+				t.Fatalf("incorrect stream outcome flags: %+v", stats)
+			}
+		})
+	}
 }
 
 func TestInferenceTimeoutSurvivesFriendlyErrorAndSuccessfulAttemptClearsIt(t *testing.T) {
